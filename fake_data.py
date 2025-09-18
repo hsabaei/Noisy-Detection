@@ -1,202 +1,258 @@
-# %% [markdown]
-# CIFAR-10 "near-dog" synthetic mislabeled set from CIFAR-100 hard negatives
-# - Mine wolf/fox/lion/tiger/leopard/bear that are closest to CIFAR-10 "dog"
-# - Save as PNG and label as "dog" (noisy labels), keep true source in CSV.
+#!/usr/bin/env python3
+# Generate near-dog mislabeled images from CIFAR-100 (wolf/fox/lion/tiger/leopard/bear)
+# All downloads/caches go to /tmp/$USER to avoid home-quota issues.
 
-import os, csv, math, json
+import os, csv, hashlib, urllib.request, shutil
 from pathlib import Path
 from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 import torchvision
-from torchvision.datasets import CIFAR10, CIFAR100
 from torchvision import transforms
 from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.datasets.utils import extract_archive
 from PIL import Image
-import numpy as np
-from tqdm.auto import tqdm
 
-# ======================= Config =======================
-OUT_DIR = Path("./synthetic_mislabeled_dog")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-MANIFEST_CSV = OUT_DIR / "manifest.csv"
+# ----------------- Force ALL caches to /tmp/$USER -----------------
+tmp_root = f"/tmp/{os.environ.get('USER','user')}"
+data_root = os.path.join(tmp_root, "datasets")
+os.makedirs(data_root, exist_ok=True)
+os.environ["TORCH_HOME"]     = os.path.join(tmp_root, "torch")
+os.environ["XDG_CACHE_HOME"] = os.path.join(tmp_root, "xdg")
+os.environ["HF_HOME"]        = os.path.join(tmp_root, "hf")
+print(">>> Using tmp_root:", tmp_root, "| data_root:", data_root)
+# -----------------------------------------------------------------
 
-# How many synthetic mislabeled "dogs" to export total:
-N_TOTAL = 200
-# Guarantee a minimum per each candidate class (if available):
-MIN_PER_CLASS = 20
+# -------------------- tqdm shim (no pip needed) -------------------
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    def tqdm(x, *a, **k): return x
+# -----------------------------------------------------------------
 
-# CIFAR-100 fine classes to consider as near-dog animals (all are 32x32)
-CANDIDATE_FINE_CLASSES = ["wolf", "fox", "lion", "tiger", "leopard", "bear"]
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ============================= CONFIG =============================
+OUT_DIR = Path("./fake_dogs")      # output folder for PNGs + manifest
+N_TOTAL = 200                      # set 100 or 200
+MIN_PER_CLASS = 20                 # per-class floor (clamped below)
 BATCH_SIZE = 256
 NUM_WORKERS = 2
 SEED = 123
+USE_PRETRAINED = True              # True => 1x 44MB ResNet18 to /tmp; False => no download
+CANDIDATE_FINE_CLASSES = ["wolf", "fox", "lion", "tiger", "leopard", "bear"]
+# =================================================================
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(SEED)
-np.random.seed(SEED)
 
-# ================== Feature Extractor ==================
-# Use ImageNet-pretrained ResNet18; strip the final FC for embeddings.
-weights = ResNet18_Weights.IMAGENET1K_V1
-feat_model = resnet18(weights=weights)
-feat_model.fc = nn.Identity()
-feat_model.eval().to(DEVICE)
+# ------------------ Robust CIFAR fetch/extract --------------------
+def _download_to(path: str, urls: list[str], desc: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for u in urls:
+        try:
+            print(f"[fetch] {desc} from {u}")
+            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=180) as r, open(path, "wb") as f:
+                shutil.copyfileobj(r, f)
+            print(f"[ok] saved to {path}")
+            return
+        except Exception as e:
+            print(f"[warn] {u} failed: {e}")
+    raise RuntimeError(f"All mirrors failed for {desc}")
 
-# Use the weights' recommended transforms (resizes to 224, normalizes)
-embed_transform = weights.transforms()
+def _md5(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-# Also keep a simple 32x32 save transform (no norm) for writing PNGs
-save_transform = transforms.Compose([
-    # CIFAR-100 already 32x32; keep as-is to match CIFAR-10 scale
-    # If you want light jitter to better match CIFAR-10 stats, you can add it here.
-])
+def ensure_cifar_archives(root: str):
+    c10_name  = "cifar-10-python.tar.gz"
+    c100_name = "cifar-100-python.tar.gz"
+    c10_path  = os.path.join(root, c10_name)
+    c100_path = os.path.join(root, c100_name)
 
-# =================== Datasets/Loaders ==================
-root = "./data"
+    C10_URLS = [
+        "https://ossci-datasets.s3.amazonaws.com/cifar/cifar-10-python.tar.gz",
+        "https://download.pytorch.org/tutorial/cifar10_tutorial/cifar-10-python.tar.gz",
+        "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz",
+        "http://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz",
+    ]
+    C100_URLS = [
+        "https://ossci-datasets.s3.amazonaws.com/cifar/cifar-100-python.tar.gz",
+        "https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz",
+        "http://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz",
+    ]
 
-c10_train = CIFAR10(root=root, train=True, download=True)
-c100_train = CIFAR100(root=root, train=True, download=True)
+    if not os.path.exists(c10_path):
+        _download_to(c10_path, C10_URLS, "CIFAR-10")
+    if not os.path.exists(c100_path):
+        _download_to(c100_path, C100_URLS, "CIFAR-100")
 
-# CIFAR-10 class order includes dog=5
-C10_CLASSES = c10_train.classes
-DOG_IDX = C10_CLASSES.index("dog")  # should be 5
+    OFFICIAL = {
+        c10_path:  "c58f30108f718f92721af3b95e74349a",
+        c100_path: "eb9058c3a382ffc7106e4002c42a8d85",
+    }
+    for p, md5 in OFFICIAL.items():
+        cur = _md5(p)
+        if cur != md5:
+            try: os.remove(p)
+            except: pass
+            raise RuntimeError(f"MD5 mismatch for {os.path.basename(p)} (have {cur}, expected {md5}).")
 
-# Map CIFAR-100 fine label names -> indices
-c100_name_to_idx = {name: i for i, name in enumerate(c100_train.classes)}
-candidate_indices = [c100_name_to_idx[name] for name in CANDIDATE_FINE_CLASSES if name in c100_name_to_idx]
-if len(candidate_indices) == 0:
-    raise ValueError("None of the desired CIFAR-100 classes found. Check class names.")
+def ensure_cifar_extracted(root: str):
+    c10_dir  = os.path.join(root,  "cifar-10-batches-py")
+    c100_dir = os.path.join(root, "cifar-100-python")
+    if not os.path.isdir(c10_dir):
+        extract_archive(os.path.join(root, "cifar-10-python.tar.gz"), root)
+    if not os.path.isdir(c100_dir):
+        extract_archive(os.path.join(root, "cifar-100-python.tar.gz"), root)
 
-# Build subsets:
-c10_dog_idxs = [i for i, (_, y) in enumerate(c10_train) if y == DOG_IDX]
-c10_dogs = Subset(c10_train, c10_dog_idxs)
+# Fetch/extract once to /tmp/$USER/datasets, then load with download=False
+ensure_cifar_archives(data_root)
+ensure_cifar_extracted(data_root)
+# -----------------------------------------------------------------
 
-c100_candidate_idxs = [i for i, (_, y) in enumerate(c100_train) if y in candidate_indices]
-c100_candidates = Subset(c100_train, c100_candidate_idxs)
+# -------- Feature extractor (ImageNet ResNet-18; silent) ----------
+if USE_PRETRAINED:
+    weights = ResNet18_Weights.IMAGENET1K_V1
+    backbone = resnet18(weights=weights, progress=False)
+    embed_transform = weights.transforms()  # resize 224 + normalize
+else:
+    backbone = resnet18(weights=None, progress=False)
+    embed_transform = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
+    ])
+backbone.fc = nn.Identity()
+backbone.eval().to(DEVICE)
+# -----------------------------------------------------------------
 
-def make_loader(dataset, tfm, shuffle=False):
-    class Wrapped(torch.utils.data.Dataset):
-        def __init__(self, base, tfm):
-            self.base = base
-            self.tfm = tfm
-        def __len__(self): return len(self.base)
-        def __getitem__(self, i):
-            img, y = self.base[i]
-            return self.tfm(img), y, i  # keep original index
-    return DataLoader(Wrapped(dataset, tfm), batch_size=BATCH_SIZE,
-                      shuffle=shuffle, num_workers=NUM_WORKERS, pin_memory=True)
+# ------------- Datasets: raw (32x32) for saving ------------------
+from torchvision.datasets import CIFAR10, CIFAR100
+c10_raw  = CIFAR10(root=data_root, train=True,  download=False, transform=None)
+c100_raw = CIFAR100(root=data_root, train=True, download=False, transform=None)
 
-dog_loader = make_loader(c10_dogs, embed_transform, shuffle=False)
-cand_loader = make_loader(c100_candidates, embed_transform, shuffle=False)
+C10_CLASSES  = c10_raw.classes
+C100_CLASSES = c100_raw.classes
 
-# ==================== Embedding Helpers ====================
-@torch.no_grad()
-def embed_batches(loader) -> Tuple[torch.Tensor, List[int]]:
-    embs = []
-    ys = []
-    idxs = []
-    for xb, yb, ib in tqdm(loader, desc="Embedding"):
-        xb = xb.to(DEVICE, non_blocking=True)
-        feats = feat_model(xb)              # (B, 512)
-        feats = nn.functional.normalize(feats, dim=1)
-        embs.append(feats.cpu())
-        ys += yb.tolist()
-        idxs += ib.tolist()
-    embs = torch.cat(embs, dim=0)
-    return embs, ys, idxs
+DOG_IDX = C10_CLASSES.index("dog")
+dog_indices = [i for i, y in enumerate(c10_raw.targets) if y == DOG_IDX]
+c10_dogs_raw = Subset(c10_raw, dog_indices)
 
-print("Embedding CIFAR-10 dogs…")
-dog_embs, _, dog_subset_idxs = embed_batches(dog_loader)
-dog_centroid = nn.functional.normalize(dog_embs.mean(dim=0, keepdim=True), dim=1)  # (1, D)
+name_to_idx_100 = {name: i for i, name in enumerate(C100_CLASSES)}
+cand_idx = [name_to_idx_100[name] for name in CANDIDATE_FINE_CLASSES if name in name_to_idx_100]
+if not cand_idx:
+    raise RuntimeError("None of the desired CIFAR-100 fine classes were found.")
+cand_indices = [i for i, y in enumerate(c100_raw.targets) if y in cand_idx]
+c100_cands_raw = Subset(c100_raw, cand_indices)
+# -----------------------------------------------------------------
 
-print("Embedding CIFAR-100 candidates…")
-cand_embs, cand_ys, cand_subset_idxs = embed_batches(cand_loader)
-
-# ==================== Similarity & Ranking ====================
-# Cosine sim to dog centroid:
-with torch.no_grad():
-    sims = (cand_embs @ dog_centroid.t()).squeeze(1).numpy()  # (N,)
-
-# Group by true CIFAR-100 class name for per-class quotas
-idx_to_name = {v: k for k, v in c100_name_to_idx.items()}
-cand_records = []
-for sim, y, sub_i in zip(sims, cand_ys, cand_subset_idxs):
-    true_name = idx_to_name[y]
-    global_i = c100_candidate_idxs[sub_i]  # original index into CIFAR-100 train
-    cand_records.append({"sim": float(sim), "true_idx": global_i, "true_name": true_name})
-
-# Sort globally by similarity (desc)
-cand_records.sort(key=lambda r: r["sim"], reverse=True)
-
-# Enforce per-class minimums, then fill remaining by global rank
-selected = []
-per_class_taken = {name: 0 for name in CANDIDATE_FINE_CLASSES if name in c100_name_to_idx}
-
-# First pass: satisfy per-class minimums
-for name in per_class_taken.keys():
-    needed = MIN_PER_CLASS
-    for rec in cand_records:
-        if rec.get("_used"): continue
-        if rec["true_name"] == name:
-            selected.append(rec)
-            rec["_used"] = True
-            per_class_taken[name] += 1
-            needed -= 1
-            if needed <= 0: break
-
-# Second pass: fill up to N_TOTAL
-for rec in cand_records:
-    if rec.get("_used"): continue
-    selected.append(rec)
-    rec["_used"] = True
-    if len(selected) >= N_TOTAL: break
-
-print(f"Selected {len(selected)} synthetic mislabeled 'dog' images.")
-
-# ==================== Save PNGs + Manifest ====================
-# We need the raw 32x32 images to save; read directly from CIFAR-100 base dataset
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-with open(MANIFEST_CSV, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["filename", "assigned_label", "true_source"])
-    for k, rec in enumerate(selected):
-        img_pil, true_y = c100_train[rec["true_idx"]]
-        # Optional: apply any 32x32-level jitter here via save_transform
-        img_pil = save_transform(img_pil) if save_transform else img_pil
-        fname = f"syn_dog_{k:05d}__src_{rec['true_name']}.png"
-        img_pil.save(OUT_DIR / fname)
-        writer.writerow([fname, "dog", rec["true_name"]])
-
-print(f"Saved images to: {OUT_DIR}")
-print(f"Manifest: {MANIFEST_CSV}")
-
-# ==================== (Optional) How to Load Mixed Data ====================
-# You can now create a Dataset that wraps CIFAR-10 + these synthetic PNGs:
-class SyntheticDogFolder(torch.utils.data.Dataset):
-    def __init__(self, folder: Path, assigned_idx: int = DOG_IDX, tfm=None):
-        self.folder = Path(folder)
-        self.files = sorted([p for p in self.folder.iterdir() if p.suffix.lower()==".png"])
-        self.assigned_idx = assigned_idx
+# -------- Wrapper to apply embedding transform lazily -------------
+class EmbedWrap(Dataset):
+    def __init__(self, base: Dataset, tfm):
+        self.base = base
         self.tfm = tfm
-    def __len__(self): return len(self.files)
+    def __len__(self): return len(self.base)
     def __getitem__(self, i):
-        img = Image.open(self.files[i]).convert("RGB")
-        if self.tfm: img = self.tfm(img)
-        return img, self.assigned_idx
+        img, y = self.base[i]  # PIL.Image, int
+        return self.tfm(img), y, i, img  # tensor for model; keep original PIL for saving
 
-# Example: mix 1:1 with CIFAR-10 training
-mix_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.4914,0.4822,0.4465), std=(0.2470,0.2435,0.2616)),
-])
+# ---- custom collate: stack tensors, keep PILs as python lists ----
+def collate_keep_pil(batch):
+    xs, ys, idxs, pils = zip(*batch)
+    xs   = torch.stack(xs, 0)
+    ys   = torch.as_tensor(ys)
+    idxs = list(idxs)
+    pils = list(pils)
+    return xs, ys, idxs, pils
 
-c10_train_tfm = torchvision.datasets.CIFAR10(root=root, train=True, download=False, transform=mix_transform)
-syn_folder_ds = SyntheticDogFolder(OUT_DIR, assigned_idx=DOG_IDX, tfm=mix_transform)
+def make_loader(ds, shuffle=False):
+    return DataLoader(
+        ds,
+        batch_size=BATCH_SIZE,
+        shuffle=shuffle,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        collate_fn=collate_keep_pil,  # <<< important to avoid PIL collate error
+    )
 
-mixed_train = torch.utils.data.ConcatDataset([c10_train_tfm, syn_folder_ds])
-print("Mixed dataset size:", len(mixed_train))
+dogs_embed = EmbedWrap(c10_dogs_raw, embed_transform)
+cands_embed = EmbedWrap(c100_cands_raw, embed_transform)
+
+dog_loader  = make_loader(dogs_embed,  shuffle=False)
+cand_loader = make_loader(cands_embed, shuffle=False)
+# -----------------------------------------------------------------
+
+@torch.no_grad()
+def embed(loader) -> Tuple[torch.Tensor, List[int], List[Image.Image]]:
+    feats, labels, pils = [], [], []
+    for xb, yb, ib, pilb in tqdm(loader, desc="Embedding"):
+        xb = xb.to(DEVICE, non_blocking=True)
+        fb = backbone(xb)
+        fb = nn.functional.normalize(fb, dim=1)  # cosine-friendly
+        feats.append(fb.cpu())
+        labels.extend(yb.tolist() if isinstance(yb, torch.Tensor) else yb)
+        pils.extend(pilb)  # list of PILs
+    return torch.cat(feats, dim=0), labels, pils
+
+# ---------- Compute dog centroid ----------
+dog_feats, _, _ = embed(dog_loader)
+dog_centroid = nn.functional.normalize(dog_feats.mean(dim=0, keepdim=True), dim=1)
+
+# ---------- Embed candidates + score ----------
+cand_feats, cand_labels_100, cand_pils = embed(cand_loader)
+sims = (cand_feats @ dog_centroid.t()).squeeze(1)
+
+idx_to_name_100 = {v: k for k, v in name_to_idx_100.items()}
+records = []
+for i, (sim, y) in enumerate(zip(sims.tolist(), cand_labels_100)):
+    records.append({"i": i, "sim": sim, "true_name": idx_to_name_100[y]})
+
+records.sort(key=lambda r: r["sim"], reverse=True)
+
+# ---------- Select with per-class mins (clamped) ----------
+num_classes_avail = max(1, len({r["true_name"] for r in records}))
+per_class_min = min(MIN_PER_CLASS, N_TOTAL // num_classes_avail)
+
+selected = []
+taken = {name: 0 for name in CANDIDATE_FINE_CLASSES if name in name_to_idx_100}
+
+# First: satisfy per-class minimums
+for cname in taken:
+    need = per_class_min
+    if need <= 0: break
+    for r in records:
+        if r.get("_used"): continue
+        if r["true_name"] == cname:
+            selected.append(r); r["_used"] = True
+            taken[cname] += 1
+            need -= 1
+            if need <= 0: break
+
+# Then: fill globally by similarity
+for r in records:
+    if len(selected) >= N_TOTAL: break
+    if not r.get("_used"):
+        selected.append(r); r["_used"] = True
+
+print(f"Selected {len(selected)} images "
+      f"(per-class floor={per_class_min}, classes available={num_classes_avail}).")
+
+# ---------------- Save outputs ----------------
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+manifest = OUT_DIR / "manifest.csv"
+with open(manifest, "w", newline="") as f:
+    wr = csv.writer(f)
+    wr.writerow(["filename", "assigned_label", "true_source", "similarity"])
+    for k, r in enumerate(selected):
+        pil = cand_pils[r["i"]]             # original 32x32 PIL
+        fn = f"syn_dog_{k:05d}__src_{r['true_name']}.png"
+        pil.save(OUT_DIR / fn)
+        wr.writerow([fn, "dog", r["true_name"], f"{r['sim']:.6f}"])
+
+print("Saved images to:", str(OUT_DIR))
+print("Manifest:", str(manifest))

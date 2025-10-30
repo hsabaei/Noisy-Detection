@@ -1,4 +1,4 @@
-import os, json
+﻿import os, json
 import numpy as np
 from collections import deque, defaultdict
 
@@ -61,70 +61,38 @@ def ckl_finite(W1, d1, W2, d2):
         return _ckl_equal_W(W1, d1, d2)
     return _ckl_case_A(W1, d1, W2, d2) if W1 < W2 else _ckl_case_B(W1, d1, W2, d2)
 
-def ckl_to_alpha(scores_np, thr, kappa=1.0, alpha_floor=0.05):
+def ckl_to_alpha(scores_np, thr, kappa=2.0, alpha_floor=0.05):
     scores = np.asarray(scores_np, dtype=np.float64)
     rel = np.maximum((scores - thr) / (thr + EPS), 0.0)
     a = np.exp(-kappa * rel)
     return np.clip(a, alpha_floor, 1.0)
 
-# =================== Class-wise CKL tracker =======================
-class ClassCklTracker:
-    """
-    Per-epoch, per-class CKL reference (W_ref, d_ref) and threshold.
-    Uses observed labels for grouping. Run-length gate persists via .runlen.
-    """
-    def __init__(self, num_classes=10, thr_mode="mean", min_run=5):
-        assert thr_mode in ("mean", "median")
-        self.num_classes = int(num_classes)
-        self.thr_mode = thr_mode
-        self.min_run = int(min_run)
+class EpochCklTracker:
+    """Online union-reference + streaming threshold + run-gate, reset each epoch."""
+    def __init__(self, thr_mode="mean", min_run=5):
+        assert thr_mode in ("mean","median")
+        self.thr_mode = thr_mode; self.min_run = min_run
         self.reset()
-        self.runlen = defaultdict(int)  # may be overwritten from outside to persist across epochs
-
     def reset(self):
-        self.logW_sum = [0.0]*self.num_classes
-        self.logd_sum = [0.0]*self.num_classes
-        self.ref_cnt  = [0]*self.num_classes
-
-        self._thr_n   = [0]*self.num_classes
-        self._thr_s   = [0.0]*self.num_classes
-        self.ckl_buf  = [[] for _ in range(self.num_classes)]
-        self.curr_thr = [0.0]*self.num_classes
-
-    # references
-    def has_ref(self, c:int) -> bool:
-        return self.ref_cnt[c] > 0
-
-    def current_ref(self, c:int):
-        if self.ref_cnt[c] == 0: return None
-        W_ref = math.exp(self.logW_sum[c] / self.ref_cnt[c])
-        d_ref = math.exp(self.logd_sum[c] / self.ref_cnt[c])
-        return float(W_ref), float(d_ref)
-
-    def update_ref_class(self, c:int, W_batch_c, d_batch_c):
-        if len(W_batch_c) == 0: return
-        Wb = np.maximum(W_batch_c, EPS)
-        db = np.maximum(d_batch_c, EPS)
-        self.logW_sum[c] += float(np.log(Wb).sum())
-        self.logd_sum[c] += float(np.log(db).sum())
-        self.ref_cnt[c]  += int(len(W_batch_c))
-
-    # thresholds
-    def current_thr_val(self, c:int) -> float:
+        self.logW_sum = 0.0; self.logd_sum = 0.0; self.ref_cnt = 0
+        self._thr_n = 0; self._thr_s = 0.0; self.ckl_buf = []
+        self.curr_thr = 0.0; self.runlen = defaultdict(int)
+    def current_ref(self):
+        if self.ref_cnt == 0: return None
+        return math.exp(self.logW_sum/self.ref_cnt), math.exp(self.logd_sum/self.ref_cnt)
+    def current_thr(self):
+        if self.thr_mode == "mean": return float(self.curr_thr)
+        return float(np.nanmedian(np.asarray(self.ckl_buf))) if self.ckl_buf else float(self.curr_thr)
+    def update_ref(self, W_batch, d_batch):
+        self.logW_sum += float(np.log(np.maximum(W_batch, EPS)).sum())
+        self.logd_sum += float(np.log(np.maximum(d_batch, EPS)).sum())
+        self.ref_cnt  += int(len(W_batch))
+    def update_thr(self, ckl_vals):
         if self.thr_mode == "mean":
-            return float(self.curr_thr[c])
-        return float(np.nanmedian(np.asarray(self.ckl_buf[c]))) if self.ckl_buf[c] else float(self.curr_thr[c])
-
-    def update_thr_class(self, c:int, ckl_vals_c):
-        if len(ckl_vals_c) == 0: return
-        if self.thr_mode == "mean":
-            self._thr_n[c] += len(ckl_vals_c)
-            self._thr_s[c] += float(np.nansum(ckl_vals_c))
-            self.curr_thr[c] = self._thr_s[c] / max(self._thr_n[c], 1)
+            self._thr_n += len(ckl_vals); self._thr_s += float(np.nansum(ckl_vals))
+            self.curr_thr = self._thr_s / max(self._thr_n, 1)
         else:
-            self.ckl_buf[c].extend(list(ckl_vals_c))
-
-    # persistent run-length gate
+            self.ckl_buf.extend(list(ckl_vals))
     def update_gates(self, sample_ids, raw_flags):
         gated = []
         for sid, raw in zip(sample_ids, raw_flags):
@@ -245,6 +213,7 @@ class ControlledCatDogNoise(Dataset):
         return x, label, int(idx), is_noisy
 
 # =================== LID Estimators ===================
+    
 class LIDEstimators:
     def __init__(self, device='cpu'):
         self.device = device
@@ -265,48 +234,74 @@ class LIDEstimators:
 
     def compute_GIE_LID(self, phi, G):
         epsilon = 1e-7
+    
+        # --- Compute deviations ---
         limit0 = np.mean(phi[-3:])
         R = np.abs(phi - limit0)
         w0 = np.max(R)
+    
         limit1 = np.mean(G[-3:])
         FR = np.abs(G - limit1)
         w1 = np.max(FR)
+    
+        # --- Paired filtering: keep only indices where both are non-zero ---
         mask = (R != 0) & (FR != 0)
         R_non_zero = R[mask]
         FR_non_zero = FR[mask]
-        Wmax = w0
+        
+        Wmax = w0#max(w0, w1)
+        # --- Number of samples for Hill ---
         k = R_non_zero.shape[0] - 1
         if k <= 4:
             return EPS, float(Wmax)
+    
+        # --- Hill estimates ---
         hill_num = - (k / np.sum(np.log(np.abs(R_non_zero / (w0 + epsilon)))))
         hill_den = - (k / np.sum(np.log(np.abs(FR_non_zero / (w1 + epsilon)))))
+    
         gie = hill_num / hill_den if hill_den != 0 else np.nan
         return float(gie), float(Wmax)
-
+    
     def compute_Bayes_GIE(self, phi, G, Num0, Den0):
         epsilon = 1e-7
+    
+        # --- Compute deviations ---
         limit0 = np.mean(phi[-3:])
         R = np.abs(phi - limit0)
         w0 = np.max(R)
+    
         limit1 = np.mean(G[-3:])
         FR = np.abs(G - limit1)
         w1 = np.max(FR)
+    
+        # --- Paired filtering: remove any index where either deviation is zero ---
         mask = (R > EPS) & (FR > EPS)
         R_non_zero = R[mask]
         FR_non_zero = FR[mask]
+    
+        # --- k value ---
         k = R_non_zero.shape[0] - 1
         if k <= 4:
-            return EPS, float(w0), 0.0, 0.0
+            return EPS, float(w0), 0.0, 0.0  # No valid samples → return NaNs and zero increments
+    
+        # --- Hill estimates ---
         hill_num = - (k / np.sum(np.log(np.abs(R_non_zero / (w0 + epsilon)))))
         hill_den = - (k / np.sum(np.log(np.abs(FR_non_zero / (w1 + epsilon)))))
+    
+        # --- Check validity ---
         if hill_num == 0 or hill_den == 0 or np.isnan(hill_num) or np.isnan(hill_den):
             Num1, Den1 = 0.0, 0.0
         else:
-            Num1 = 1.0 / hill_den
-            Den1 = 1.0 / hill_num
+            Num1 = 1.0 / hill_den   # Denominator's Hill goes in numerator's sum
+            Den1 = 1.0 / hill_num   # Numerator's Hill goes in denominator's sum
+    
+        # --- Update cumulative sums ---
         Num_cumulative = Num0 + Num1
         Den_cumulative = Den0 + Den1
+    
+        # --- Compute Bayesian GIE ---
         LID_Bayes = Num_cumulative / Den_cumulative if Den_cumulative != 0 else EPS
+    
         return LID_Bayes, float(w0), Num1, Den1
 
     def compute_FIE_LID(self, phi_prev, phi_next):
@@ -340,13 +335,17 @@ def compute_accuracy(model, data_loader, device):
     return 100 * correct / max(total, 1)
 
 def get_phi_for_indices(distance_queues, indices, k_required):
+    """
+    Collect per-sample phi (recent losses) for each index.
+    Returns: list[ndarray or None]
+    """
     phis = []
     for idx in indices:
         dq = distance_queues.get(int(idx), None)
         if dq is None or len(dq) < k_required:
             phis.append(None)
         else:
-            vals = [v for (v) in dq]
+            vals = [v for (v) in dq]  # dq stores raw losses (floats)
             phis.append(np.asarray(vals, dtype=float))
     return phis
 
@@ -354,7 +353,7 @@ def get_phi_for_indices(distance_queues, indices, k_required):
 def train_model(model, train_loader, test_loader, num_epochs, k, device):
     """
     If USE_CKL is False: trains with plain CE (baseline).
-    If USE_CKL is True : trains with online Bayes-GIE -> CKL -> class-wise alpha_i -> D2L soft targets.
+    If USE_CKL is True : trains with online Bayes-GIE -> CKL -> alpha_i -> D2L soft targets.
     """
     model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
@@ -366,19 +365,23 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
     # ---------- CKL/Bayes-GIE state (only if enabled) ----------
     if USE_CKL:
         lid = LIDEstimators(device=device)
-        distance_queues: dict[int, deque] = {}    # idx -> deque[float] of length k
+        # per-sample sliding windows of recent CE (phi)
+        distance_queues: dict[int, deque] = {}  # idx -> deque[float] of length k
+        # (optional bookkeeping; latest increments only in overwrite mode)
         cum_num_bgie: dict[int, float] = defaultdict(float)
         cum_den_bgie: dict[int, float] = defaultdict(float)
-        runlen_global: dict[int, int] = defaultdict(int)  # persists across epochs
-        G_global = deque(maxlen=k)                        # global train-loss reference (length k)
+        # CKL gate run-length persists across epochs
+        runlen_global: dict[int, int] = defaultdict(int)
+        # Global training-loss reference G (length k)
+        G_global = deque(maxlen=k)
 
     for epoch in range(num_epochs):
         model.train()
         running_loss_sum, running_count = 0.0, 0
 
-        # Per-epoch class-wise tracker (refs + thresholds); gate persists
+        # CKL tracker: reset reference/threshold per epoch; persist run-lengths
         if USE_CKL:
-            tracker = ClassCklTracker(num_classes=10, thr_mode="mean", min_run=5)
+            tracker = EpochCklTracker(thr_mode="mean", min_run=5)
             tracker.runlen = runlen_global
 
         for batch_idx, (inputs, labels, indices, is_noisy) in enumerate(train_loader):
@@ -417,7 +420,8 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
             phi_list = get_phi_for_indices(distance_queues, indices_np, k_required=k)
 
             # Bayes-GIE (W,d) for this batch (overwrite/window-only mode)
-            W_list, d_list, have_bg = [], [], []
+            W_list, d_list = [], []
+            have_bg = []
             for i, idx in enumerate(indices_np):
                 if phi_list[i] is None or len(G_global) < k:
                     W_list.append(np.nan); d_list.append(np.nan); have_bg.append(False)
@@ -426,9 +430,11 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                 phi = phi_list[i]                                 # length k
                 G_tr = np.asarray(list(G_global), dtype=float)    # length k
 
+                # OVERWRITE mode: do not carry cumulants
                 NG0, DG0 = 0.0, 0.0
                 bayes_val, W_i, Num_inc, Den_inc = lid.compute_Bayes_GIE(phi, G_tr, NG0, DG0)
 
+                # (optional bookkeeping of latest increments)
                 cum_num_bgie[int(idx)] = Num_inc
                 cum_den_bgie[int(idx)] = Den_inc
 
@@ -444,51 +450,40 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                 yhat = torch.softmax(logits, dim=1).detach()
                 yone = F.one_hot(labels, num_classes=logits.size(1)).to(logits.dtype)
 
-            # ----------------- CLASS-WISE CKL -----------------
-            labels_np = labels.cpu().numpy()
-            valid_all = np.isfinite(W_b) & np.isfinite(d_b) & (W_b > 0) & (d_b > 0)
+            # CKL union reference (bootstrap from current batch if needed)
+            ref = tracker.current_ref()
+            if ref is None:
+                valid = np.isfinite(W_b) & np.isfinite(d_b) & (W_b > 0) & (d_b > 0)
+                if not np.any(valid):
+                    # still warming up: plain CE for this batch
+                    loss = per_sample_ce(logits, labels).mean()
+                    optimizer.zero_grad(); loss.backward(); optimizer.step()
+                    running_loss_sum += float(loss.detach().cpu()) * labels.size(0)
+                    running_count    += int(labels.numel())
+                    continue
+                W_ref = float(np.exp(np.log(W_b[valid]).mean()))
+                d_ref = float(np.exp(np.log(d_b[valid]).mean()))
+            else:
+                W_ref, d_ref = ref
 
-            # If a class has no ref yet, try bootstrapping from current valid samples of that class
-            for c in range(10):
-                if not tracker.has_ref(c):
-                    mask_c = (labels_np == c) & valid_all
-                    if np.any(mask_c):
-                        tracker.update_ref_class(c, W_b[mask_c], d_b[mask_c])
-
-            # Compute CKL per sample against its own class reference
+            # CKL for samples with BGIE
             ckl_vals = np.full(len(indices_np), np.nan, dtype=np.float64)
             for i in range(len(indices_np)):
-                if not have_bg[i] or not valid_all[i]:
-                    continue
-                c_i = int(labels_np[i])
-                ref_i = tracker.current_ref(c_i)
-                if ref_i is None:
-                    continue
-                W_ref_i, d_ref_i = ref_i
-                ckl_vals[i] = ckl_finite(W_b[i], d_b[i], W_ref_i, d_ref_i)
+                if have_bg[i] and np.isfinite(W_b[i]) and np.isfinite(d_b[i]) and W_b[i] > 0 and d_b[i] > 0:
+                    ckl_vals[i] = ckl_finite(W_b[i], d_b[i], W_ref, d_ref)
 
-            # Per-sample thresholds (value from its class BEFORE updates with this batch)
-            thr_now_per_i = np.zeros(len(indices_np), dtype=np.float64)
-            for i in range(len(indices_np)):
-                c_i = int(labels_np[i])
-                thr_now_per_i[i] = tracker.current_thr_val(c_i)
+            # threshold BEFORE updating with this batch
+            thr_now = tracker.current_thr()
 
-            # Gate using class-wise thresholds
-            raw_flags = np.isfinite(ckl_vals) & (ckl_vals > thr_now_per_i)
+            # α from CKL where available; else 1.0. Apply gate (persistent runlen).
+            raw_flags = np.isfinite(ckl_vals) & (ckl_vals > thr_now)
             gated     = tracker.update_gates(indices_np.tolist(), raw_flags)
 
-            # α from CKL (class-wise threshold already used above)
             alphas_np = np.ones(len(indices_np), dtype=np.float64)
-            finite_mask = np.isfinite(ckl_vals)
-            if np.any(finite_mask):
-                for c in range(10):
-                    sel = finite_mask & (labels_np == c)
-                    if np.any(sel):
-                        a_c = ckl_to_alpha(ckl_vals[sel], tracker.current_thr_val(c), kappa=3.0, alpha_floor=0.05)
-                        alphas_np[sel] = a_c
-
-            # hard clamp if gated
-            alphas_np = np.where(gated, 0.05, alphas_np)
+            if np.any(np.isfinite(ckl_vals)):
+                a_calc = ckl_to_alpha(ckl_vals[np.isfinite(ckl_vals)], thr_now, kappa=3.0, alpha_floor=0.05)
+                alphas_np[np.isfinite(ckl_vals)] = a_calc
+            alphas_np = np.where(gated, 0.05, alphas_np)  # hard clamp on gate
             alphas = torch.tensor(alphas_np, device=device, dtype=logits.dtype)
 
             # D2L loss with y* = α y + (1-α) ŷ
@@ -501,12 +496,11 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
             loss.backward()
             optimizer.step()
 
-            # Update per-class reference & thresholds with current batch
-            for c in range(10):
-                mask_c_valid = (labels_np == c) & valid_all
-                if np.any(mask_c_valid):
-                    tracker.update_ref_class(c, W_b[mask_c_valid], d_b[mask_c_valid])
-                    tracker.update_thr_class(c, ckl_vals[mask_c_valid])
+            # update CKL reference & threshold with current BGIE
+            valid = np.isfinite(W_b) & np.isfinite(d_b) & (W_b > 0) & (d_b > 0)
+            if np.any(valid):
+                tracker.update_ref(W_b[valid], d_b[valid])
+                tracker.update_thr(ckl_vals[valid])
 
             running_loss_sum += float(loss.detach().cpu()) * labels.size(0)
             running_count    += int(labels.numel())
@@ -552,3 +546,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

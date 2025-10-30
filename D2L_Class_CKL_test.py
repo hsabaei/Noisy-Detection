@@ -10,6 +10,7 @@ import torchvision
 import torchvision.transforms as transforms
 import math, numpy as np, torch
 from collections import defaultdict
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # ======================= Config =======================
 SEED = 12345
@@ -18,12 +19,11 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 NUM_EPOCHS   = 120
 BATCH_SIZE   = 128
 LR           = 0.1
-MOMENTUM     = 0.0
-WEIGHT_DECAY = 0.0
+MOMENTUM     = 0.9
+WEIGHT_DECAY = 5e-4
 
 K_WINDOW     = 22          # sliding window for FIE/GIE
 FLIP_SEED    = 777         # which cats get flipped to dog
-N_CATS_FLIP  = 0         # exactly 100 cats → dog
 
 EPS = 1e-12
 
@@ -181,68 +181,46 @@ class ResNet(nn.Module):
 
 def ResNet32(): return ResNet(BasicBlock, [5,5,5])
 
-# =================== Controlled noise =================
-class ControlledCatDogNoise(Dataset):
+class SymmetricNoisyCIFAR10(Dataset):
     """
-    Wrap CIFAR10 train set.
-    - Flip exactly N_CATS_FLIP items with true class 'cat' → label 'dog'.
-    - Keep all others unchanged.
-    - Exposes:
-        .noisy_mask[idx]   -> True if this idx is flipped cat→dog
-        .group_map[idx]    -> 'cat' (clean cat), 'dog' (clean dog), 'noisy' (flipped cat), or 'other'
+    Symmetric noise: each true label is flipped to any *other* class with probability `noise_ratio`.
     """
-    def __init__(self, base_dataset, n_flip=100, seed=777):
-        self.base = base_dataset
-        self.n_flip = int(n_flip)
+    def __init__(self, dataset, noise_ratio=0.4, seed=777):
+        self.dataset = dataset
+        self.noise_ratio = float(noise_ratio)
+        self.seed = seed
 
-        # resolve class indices robustly
-        cls2idx = self.base.class_to_idx
-        self.cat_idx = int(cls2idx['cat'])
-        self.dog_idx = int(cls2idx['dog'])
+        # ---- extract clean labels ------------------------------------------------
+        if hasattr(dataset, "targets"):
+            self.clean_labels = list(map(int, dataset.targets))
+        else:
+            self.clean_labels = [int(lbl) for _, lbl in dataset]
 
-        # original labels
-        self.labels = [int(lbl) for _, lbl in self.base]
-
-        # all cat/dog indices
-        self.cat_ids = [i for i,l in enumerate(self.labels) if l == self.cat_idx]
-        self.dog_ids = [i for i,l in enumerate(self.labels) if l == self.dog_idx]
+        self.noisy_labels = self.clean_labels.copy()
+        self.noisy_mask   = [False] * len(self.clean_labels)
 
         rng = np.random.default_rng(seed)
-        if self.n_flip > len(self.cat_ids):
-            raise ValueError(f"Requested {self.n_flip} flips but only {len(self.cat_ids)} cats exist.")
-        self.flipped_ids = sorted(rng.choice(self.cat_ids, size=self.n_flip, replace=False).tolist())
+        n = len(self.clean_labels)
+        n_flip = int(round(self.noise_ratio * n))
+        flip_idx = rng.choice(n, size=n_flip, replace=False)
 
-        # build noisy labels
-        self.noisy_labels = list(self.labels)
-        for i in self.flipped_ids:
-            self.noisy_labels[i] = self.dog_idx
+        for idx in flip_idx:
+            true = self.clean_labels[idx]
+            others = [c for c in range(10) if c != true]
+            self.noisy_labels[idx] = int(rng.choice(others))
+            self.noisy_mask[idx]   = True
 
-        # masks & groups
-        n = len(self.labels)
-        self.noisy_mask = np.zeros(n, dtype=bool)
-        self.noisy_mask[self.flipped_ids] = True
-
-        self.group_map = {}
-        flipped_set = set(self.flipped_ids)
-        for i in range(n):
-            if i in flipped_set:
-                self.group_map[i] = 'noisy'       # cat flipped to dog
-            elif self.labels[i] == self.cat_idx:
-                self.group_map[i] = 'cat'         # clean cat
-            elif self.labels[i] == self.dog_idx:
-                self.group_map[i] = 'dog'         # clean dog
-            else:
-                self.group_map[i] = 'other'       # other classes
-
-        print(f"[Noise] Flipped exactly {self.n_flip} cats → dog.")
-
-    def __len__(self): return len(self.base)
+        # report real flip rate
+        real_rate = sum(self.noisy_mask) / n
+        print(f"Symmetric noise: {sum(self.noisy_mask)} samples flipped "
+              f"({real_rate:.2%} of total, target {self.noise_ratio:.2%})")
+        
+    def __len__(self):
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        x, _true = self.base[idx]
-        label = int(self.noisy_labels[idx])
-        is_noisy = bool(self.noisy_mask[idx])
-        return x, label, int(idx), is_noisy
+        img, _ = self.dataset[idx]                 # ignore original label
+        return img, int(self.noisy_labels[idx]), int(idx), bool(self.noisy_mask[idx])
 
 # =================== LID Estimators ===================
 class LIDEstimators:
@@ -352,83 +330,87 @@ def get_phi_for_indices(distance_queues, indices, k_required):
 
 # =================== Training & logging ===============
 def train_model(model, train_loader, test_loader, num_epochs, k, device):
-    """
-    If USE_CKL is False: trains with plain CE (baseline).
-    If USE_CKL is True : trains with online Bayes-GIE -> CKL -> class-wise alpha_i -> D2L soft targets.
-    """
+    WARMUP_EPOCHS = k  # Wait until each sample has ~k CE points
+
     model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
     per_sample_ce = nn.CrossEntropyLoss(reduction='none')
     global_ce     = nn.CrossEntropyLoss()
 
-    loss_history, test_loss_history = [], []
-
-    # ---------- CKL/Bayes-GIE state (only if enabled) ----------
+    # ---------- CKL/Bayes-GIE state ----------
     if USE_CKL:
         lid = LIDEstimators(device=device)
-        distance_queues: dict[int, deque] = {}    # idx -> deque[float] of length k
-        cum_num_bgie: dict[int, float] = defaultdict(float)
-        cum_den_bgie: dict[int, float] = defaultdict(float)
-        runlen_global: dict[int, int] = defaultdict(int)  # persists across epochs
-        G_global = deque(maxlen=k)                        # global train-loss reference (length k)
+        distance_queues = {}           # idx -> deque[float] of length k
+        cum_num_bgie = defaultdict(float)
+        cum_den_bgie = defaultdict(float)
+        runlen_global = defaultdict(int)  # persists across epochs
+        G_global = deque(maxlen=k)        # global train-loss reference
+    else:
+        lid = None
+        distance_queues = {}
+        cum_num_bgie = {}
+        cum_den_bgie = {}
+        runlen_global = {}
+        G_global = deque(maxlen=k)
 
     for epoch in range(num_epochs):
         model.train()
         running_loss_sum, running_count = 0.0, 0
 
-        # Per-epoch class-wise tracker (refs + thresholds); gate persists
+        # Per-epoch tracker (resets refs/thr, keeps runlen)
         if USE_CKL:
             tracker = ClassCklTracker(num_classes=10, thr_mode="mean", min_run=5)
             tracker.runlen = runlen_global
+        else:
+            tracker = None
 
+        # ===================== TRAINING LOOP =====================
         for batch_idx, (inputs, labels, indices, is_noisy) in enumerate(train_loader):
             inputs, labels = inputs.to(device), labels.to(device)
             indices_np = indices.cpu().numpy()
 
-            # forward
+            # Forward
             logits = model(inputs)
 
-            # ===== Baseline: no CKL/Bayes-GIE =====
-            if not USE_CKL:
+            # --- RECORD CE HISTORY (even during warmup) ---
+            if USE_CKL:
+                ce_vec = per_sample_ce(logits, labels).detach().cpu().numpy()
+                batch_mean_ce = float(np.mean(ce_vec))
+                G_global.append(batch_mean_ce)
+
+                for i, idx in enumerate(indices_np):
+                    dq = distance_queues.get(int(idx))
+                    if dq is None:
+                        dq = deque(maxlen=k)
+                        distance_queues[int(idx)] = dq
+                    dq.append(float(ce_vec[i]))
+
+            # --- WARMUP: plain CE ---
+            if (not USE_CKL) or (epoch < WARMUP_EPOCHS):
                 loss = global_ce(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
                 running_loss_sum += float(loss.detach().cpu()) * labels.size(0)
-                running_count    += int(labels.numel())
+                running_count += labels.numel()
                 continue
-            # ======================================
 
-            # per-sample CE (used for phi and warmup)
-            ce_vec = per_sample_ce(logits, labels).detach().cpu().numpy()
-            batch_mean_ce = float(np.mean(ce_vec))
-            G_global.append(batch_mean_ce)
-
-            # update phi windows BEFORE Bayes-GIE
-            for i, idx in enumerate(indices_np):
-                dq = distance_queues.get(int(idx))
-                if dq is None:
-                    dq = deque(maxlen=k)
-                    distance_queues[int(idx)] = dq
-                dq.append(float(ce_vec[i]))
-
-            # collect phi (None if not enough history)
+            # --- AFTER WARMUP: CKL + CE (no D2L) ---
             phi_list = get_phi_for_indices(distance_queues, indices_np, k_required=k)
 
-            # Bayes-GIE (W,d) for this batch (overwrite/window-only mode)
             W_list, d_list, have_bg = [], [], []
             for i, idx in enumerate(indices_np):
                 if phi_list[i] is None or len(G_global) < k:
                     W_list.append(np.nan); d_list.append(np.nan); have_bg.append(False)
                     continue
 
-                phi = phi_list[i]                                 # length k
-                G_tr = np.asarray(list(G_global), dtype=float)    # length k
-
-                NG0, DG0 = 0.0, 0.0
+                phi = phi_list[i]
+                G_tr = np.asarray(list(G_global), dtype=float)
+                NG0, DG0 = cum_num_bgie[int(idx)], cum_den_bgie[int(idx)]
                 bayes_val, W_i, Num_inc, Den_inc = lid.compute_Bayes_GIE(phi, G_tr, NG0, DG0)
 
+                # Your exact logic
                 cum_num_bgie[int(idx)] = Num_inc
                 cum_den_bgie[int(idx)] = Den_inc
 
@@ -438,70 +420,32 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
 
             W_b = np.asarray(W_list, dtype=np.float64)
             d_b = np.asarray(d_list, dtype=np.float64)
-
-            # yhat, one-hot
-            with torch.no_grad():
-                yhat = torch.softmax(logits, dim=1).detach()
-                yone = F.one_hot(labels, num_classes=logits.size(1)).to(logits.dtype)
-
-            # ----------------- CLASS-WISE CKL -----------------
             labels_np = labels.cpu().numpy()
-            valid_all = np.isfinite(W_b) & np.isfinite(d_b) & (W_b > 0) & (d_b > 0)
+            valid_all = np.isfinite(W_b) & np.isfinite(d_b) & (W_b > 0) & (d_b > 0)  
 
-            # If a class has no ref yet, try bootstrapping from current valid samples of that class
-            for c in range(10):
-                if not tracker.has_ref(c):
-                    mask_c = (labels_np == c) & valid_all
-                    if np.any(mask_c):
-                        tracker.update_ref_class(c, W_b[mask_c], d_b[mask_c])
-
-            # Compute CKL per sample against its own class reference
+            # Compute CKL
             ckl_vals = np.full(len(indices_np), np.nan, dtype=np.float64)
             for i in range(len(indices_np)):
-                if not have_bg[i] or not valid_all[i]:
-                    continue
+                if not have_bg[i] or not valid_all[i]: continue
                 c_i = int(labels_np[i])
                 ref_i = tracker.current_ref(c_i)
-                if ref_i is None:
-                    continue
+                if ref_i is None: continue
                 W_ref_i, d_ref_i = ref_i
                 ckl_vals[i] = ckl_finite(W_b[i], d_b[i], W_ref_i, d_ref_i)
 
-            # Per-sample thresholds (value from its class BEFORE updates with this batch)
-            thr_now_per_i = np.zeros(len(indices_np), dtype=np.float64)
-            for i in range(len(indices_np)):
-                c_i = int(labels_np[i])
-                thr_now_per_i[i] = tracker.current_thr_val(c_i)
-
-            # Gate using class-wise thresholds
+            # Thresholds
+            thr_now_per_i = np.array([tracker.current_thr_val(int(labels_np[i])) for i in range(len(indices_np))])
             raw_flags = np.isfinite(ckl_vals) & (ckl_vals > thr_now_per_i)
-            gated     = tracker.update_gates(indices_np.tolist(), raw_flags)
+            gated = tracker.update_gates(indices_np.tolist(), raw_flags)
 
-            # α from CKL (class-wise threshold already used above)
-            alphas_np = np.ones(len(indices_np), dtype=np.float64)
-            finite_mask = np.isfinite(ckl_vals)
-            if np.any(finite_mask):
-                for c in range(10):
-                    sel = finite_mask & (labels_np == c)
-                    if np.any(sel):
-                        a_c = ckl_to_alpha(ckl_vals[sel], tracker.current_thr_val(c), kappa=3.0, alpha_floor=0.05)
-                        alphas_np[sel] = a_c
+            # --- NO D2L: use plain CE ---
+            loss = global_ce(logits, labels)
 
-            # hard clamp if gated
-            alphas_np = np.where(gated, 0.05, alphas_np)
-            alphas = torch.tensor(alphas_np, device=device, dtype=logits.dtype)
-
-            # D2L loss with y* = α y + (1-α) ŷ
-            y_star = alphas.unsqueeze(1) * yone + (1.0 - alphas).unsqueeze(1) * yhat
-            loss_vec = -(y_star * F.log_softmax(logits, dim=1)).sum(dim=1)
-            loss = loss_vec.mean()
-
-            # step
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # Update per-class reference & thresholds with current batch
+            # Update refs & thresholds
             for c in range(10):
                 mask_c_valid = (labels_np == c) & valid_all
                 if np.any(mask_c_valid):
@@ -509,46 +453,150 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                     tracker.update_thr_class(c, ckl_vals[mask_c_valid])
 
             running_loss_sum += float(loss.detach().cpu()) * labels.size(0)
-            running_count    += int(labels.numel())
+            running_count += labels.numel()
 
-        # epoch metrics
-        loss_history.append(running_loss_sum / max(running_count, 1))
+        # ===================== EVAL DETECTION (Every Epoch) =====================
+                # ===================== EVAL DETECTION + BOOTSTRAP (Every Epoch) =====================
+        if USE_CKL:
+            model.eval()
+            all_true_noisy = []
+            all_detected = []
+
+            # === FULL PASS: Compute Bayes-GIE + Collect High-Conf for Bootstrap ===
+            high_conf_W = [[] for _ in range(10)]
+            high_conf_d = [[] for _ in range(10)]
+
+            with torch.no_grad():
+                for inputs, labels, indices, is_noisy in train_loader:
+                    inputs = inputs.to(device)
+                    indices_np = indices.cpu().numpy()
+                    is_noisy_np = np.array(is_noisy.cpu(), dtype=bool)
+                    labels_np = labels.cpu().numpy()
+
+                    logits = model(inputs)
+                    probs = torch.softmax(logits, dim=1)
+                    max_probs, pred_labels = torch.max(probs, dim=1)
+
+                    # --- Compute Bayes-GIE ---
+                    phi_list = get_phi_for_indices(distance_queues, indices_np, k_required=k)
+                    W_list, d_list, have_bg = [], [], []
+                    for i, idx in enumerate(indices_np):
+                        if phi_list[i] is None or len(G_global) < k:
+                            W_list.append(np.nan); d_list.append(np.nan); have_bg.append(False)
+                            continue
+                        phi = phi_list[i]
+                        G_tr = np.asarray(list(G_global), dtype=float)
+                        NG0, DG0 = cum_num_bgie[int(idx)], cum_den_bgie[int(idx)]
+                        bayes_val, W_i, Num_inc, Den_inc = lid.compute_Bayes_GIE(phi, G_tr, NG0, DG0)
+                        cum_num_bgie[int(idx)] = Num_inc
+                        cum_den_bgie[int(idx)] = Den_inc
+                        W_list.append(W_i if np.isfinite(W_i) and W_i > 0 else np.nan)
+                        d_list.append(bayes_val if np.isfinite(bayes_val) and bayes_val > 0 else np.nan)
+                        have_bg.append(True)
+
+                    W_b = np.asarray(W_list, dtype=np.float64)
+                    d_b = np.asarray(d_list, dtype=np.float64)
+                    valid_all = np.isfinite(W_b) & np.isfinite(d_b) & (W_b > 0) & (d_b > 0)
+
+                    # === BOOTSTRAP: Collect high-conf clean samples ===
+                    conf_threshold = 0.80 if epoch >= 30 else 0.60
+                    conf_mask = max_probs.cpu().numpy() > conf_threshold
+                    for c in range(10):
+                        mask_c = (labels_np == c) & conf_mask & valid_all
+                        if np.any(mask_c):
+                            high_conf_W[c].extend(W_b[mask_c])
+                            high_conf_d[c].extend(d_b[mask_c])
+
+                    # === CKL + Gating ===
+                    ckl_vals = np.full(len(indices_np), np.nan, dtype=np.float64)
+                    for i in range(len(indices_np)):
+                        if not have_bg[i] or not valid_all[i]: continue
+                        c_i = int(labels_np[i])
+                        ref_i = tracker.current_ref(c_i)
+                        if ref_i is None: continue
+                        W_ref_i, d_ref_i = ref_i
+                        ckl_vals[i] = ckl_finite(W_b[i], d_b[i], W_ref_i, d_ref_i)
+
+                    thr_now_per_i = np.array([tracker.current_thr_val(int(labels_np[i])) for i in range(len(indices_np))])
+                    raw_flags = np.isfinite(ckl_vals) & (ckl_vals > thr_now_per_i)
+                    gated = tracker.update_gates(indices_np.tolist(), raw_flags)
+
+                    all_true_noisy.extend(is_noisy_np.tolist())
+                    all_detected.extend(gated.tolist())
+
+            # === APPLY BOOTSTRAP AFTER FULL PASS ===
+            for c in range(10):
+                if tracker.has_ref(c): continue
+                if len(high_conf_W[c]) >= 5:
+                    print(f"  [EVAL BOOTSTRAP @ epoch {epoch+1}] Class {c}: using {len(high_conf_W[c])} high-conf samples")
+                    tracker.update_ref_class(c, np.array(high_conf_W[c]), np.array(high_conf_d[c]))
+
+            # === Detection Stats ===
+            all_true_noisy = np.array(all_true_noisy, dtype=bool)
+            all_detected = np.array(all_detected, dtype=bool)
+            tp = np.sum(all_true_noisy & all_detected)
+            fp = np.sum(~all_true_noisy & all_detected)
+            fn = np.sum(all_true_noisy & ~all_detected)
+            prec = tp / max(tp + fp, 1)
+            rec = tp / max(tp + fn, 1)
+            print(f"  [GLOBAL Detection @ epoch {epoch+1}] "
+                  f"Prec:{prec:.3f} Rec:{rec:.3f} TP/FP/FN:{tp}/{fp}/{fn} "
+                  f"(out of {np.sum(all_true_noisy)} noisy samples)")
+            model.train()
+
+        # ===================== EPOCH METRICS =====================
+        train_loss = running_loss_sum / max(running_count, 1)
 
         model.eval()
-        t_sum, t_cnt = 0.0, 0
+        test_loss = 0.0
         with torch.no_grad():
             for x, y in test_loader:
                 x, y = x.to(device), y.to(device)
                 logits = model(x)
-                t_sum += float(global_ce(logits, y).detach().cpu()) * y.size(0)
-                t_cnt += int(y.numel())
-        test_loss_history.append(t_sum / max(t_cnt, 1))
+                test_loss += float(global_ce(logits, y).detach().cpu()) * y.size(0)
+        test_loss /= len(test_loader.dataset)
 
         train_acc = compute_accuracy(model, train_loader, device)
-        test_acc  = compute_accuracy(model, test_loader,  device)
-        print(f"Epoch [{epoch+1}/{num_epochs}] "
-              f"TrainLoss={loss_history[-1]:.4f} TestLoss={test_loss_history[-1]:.4f} "
-              f"TrainAcc={train_acc:.2f}% TestAcc={test_acc:.2f}%")
+        test_acc  = compute_accuracy(model, test_loader, device)
 
+        print(f"Epoch [{epoch+1}/{num_epochs}] "
+              f"TrainLoss={train_loss:.4f} TestLoss={test_loss:.4f} "
+              f"TrainAcc={train_acc:.2f}% TestAcc={test_acc:.2f}%")
+     
 # =================== Main =============================
 def main():
     device = DEVICE
-    transform = transforms.Compose([
+
+    transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914,0.4822,0.4465), (0.2023,0.1994,0.2010)),
+    ])
+    transform_test = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914,0.4822,0.4465), (0.2023,0.1994,0.2010)),
     ])
 
-    train_set_raw = torchvision.datasets.CIFAR10(root='./data', train=True,  download=True, transform=transform)
-    test_set      = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+    # ---- data -------------------------------------------------
+    train_set_raw = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                                download=True, transform=transform_train)
+    test_set      = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                                download=True, transform=transform_test)
 
-    # single dataset with exactly 100 cat→dog flips
-    train_set = ControlledCatDogNoise(train_set_raw, n_flip=N_CATS_FLIP, seed=FLIP_SEED)
+    train_set = SymmetricNoisyCIFAR10(train_set_raw, noise_ratio=0.4, seed=FLIP_SEED)
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = ResNet32()
-    train_model(model, train_loader, test_loader, NUM_EPOCHS, K_WINDOW, device)
+    # ---- model ------------------------------------------------
+    model = ResNet32().to(device)
+
+    # ---- train ------------------------------------------------
+    train_model(model, train_loader, test_loader,
+                num_epochs=NUM_EPOCHS,
+                k=K_WINDOW,               # used for queues
+                device=device)
 
 if __name__ == '__main__':
     main()

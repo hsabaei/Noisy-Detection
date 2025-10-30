@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 SEED = 12345
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-NUM_EPOCHS   = 120
+NUM_EPOCHS   = 50
 BATCH_SIZE   = 128
 LR           = 0.1
 MOMENTUM     = 0
@@ -413,7 +413,6 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
             conf_np  = conf.cpu().numpy()
             labels_np = labels.detach().cpu().numpy()
 
-
             # --- ALWAYS record per-sample CE history (even during warm-up) ---
             if USE_CKL:
                 ce_vec = per_sample_ce(logits, labels).detach().cpu().numpy()
@@ -427,15 +426,15 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
             # ----------------------------------------------------------------
 
             # ===== Warm-up: optimize CE only (no CKL/D2L used yet) =====
-            if (not USE_CKL) or (epoch < WARMUP_EPOCHS):
-                loss = global_ce(logits, labels)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            #if (not USE_CKL) or (epoch < WARMUP_EPOCHS):
+            #    loss = global_ce(logits, labels)
+            #    optimizer.zero_grad()
+            #    loss.backward()
+            #    optimizer.step()
 
-                running_loss_sum += float(loss.detach().cpu()) * labels.size(0)
-                running_count    += int(labels.numel())
-                continue
+             #   running_loss_sum += float(loss.detach().cpu()) * labels.size(0)
+             #   running_count    += int(labels.numel())
+             #   continue
             # ============================================================
 
             # ----------------- CKL/D2L branch -----------------

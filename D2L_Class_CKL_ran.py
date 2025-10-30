@@ -23,7 +23,6 @@ WEIGHT_DECAY = 0.0
 
 K_WINDOW     = 22          # sliding window for FIE/GIE
 FLIP_SEED    = 777         # which cats get flipped to dog
-N_CATS_FLIP  = 0         # exactly 100 cats → dog
 
 EPS = 1e-12
 
@@ -181,68 +180,47 @@ class ResNet(nn.Module):
 
 def ResNet32(): return ResNet(BasicBlock, [5,5,5])
 
-# =================== Controlled noise =================
-class ControlledCatDogNoise(Dataset):
-    """
-    Wrap CIFAR10 train set.
-    - Flip exactly N_CATS_FLIP items with true class 'cat' → label 'dog'.
-    - Keep all others unchanged.
-    - Exposes:
-        .noisy_mask[idx]   -> True if this idx is flipped cat→dog
-        .group_map[idx]    -> 'cat' (clean cat), 'dog' (clean dog), 'noisy' (flipped cat), or 'other'
-    """
-    def __init__(self, base_dataset, n_flip=100, seed=777):
-        self.base = base_dataset
-        self.n_flip = int(n_flip)
+class NoisyLabelCIFAR10(Dataset):
+    def __init__(self, dataset, noise_ratio=0.6, num_classes=10, seed=777):
+        assert 0.0 <= noise_ratio <= 1.0
+        self.dataset = dataset
+        self.noise_ratio = float(noise_ratio)
+        self.num_classes = int(num_classes)
 
-        # resolve class indices robustly
-        cls2idx = self.base.class_to_idx
-        self.cat_idx = int(cls2idx['cat'])
-        self.dog_idx = int(cls2idx['dog'])
+        # Fast path to labels if available (CIFAR10 has .targets)
+        if hasattr(dataset, "targets"):
+            self.labels = list(map(int, dataset.targets))
+        else:
+            # Fallback (slower): iterate once to read labels
+            self.labels = [int(lbl) for _, lbl in dataset]
 
-        # original labels
-        self.labels = [int(lbl) for _, lbl in self.base]
-
-        # all cat/dog indices
-        self.cat_ids = [i for i,l in enumerate(self.labels) if l == self.cat_idx]
-        self.dog_ids = [i for i,l in enumerate(self.labels) if l == self.dog_idx]
+        n = len(self.labels)
+        n_noisy = int(round(self.noise_ratio * n))
 
         rng = np.random.default_rng(seed)
-        if self.n_flip > len(self.cat_ids):
-            raise ValueError(f"Requested {self.n_flip} flips but only {len(self.cat_ids)} cats exist.")
-        self.flipped_ids = sorted(rng.choice(self.cat_ids, size=self.n_flip, replace=False).tolist())
+        noisy_indices = rng.choice(n, size=n_noisy, replace=False)
 
-        # build noisy labels
-        self.noisy_labels = list(self.labels)
-        for i in self.flipped_ids:
-            self.noisy_labels[i] = self.dog_idx
-
-        # masks & groups
-        n = len(self.labels)
         self.noisy_mask = np.zeros(n, dtype=bool)
-        self.noisy_mask[self.flipped_ids] = True
+        self.noisy_mask[noisy_indices] = True
 
-        self.group_map = {}
-        flipped_set = set(self.flipped_ids)
-        for i in range(n):
-            if i in flipped_set:
-                self.group_map[i] = 'noisy'       # cat flipped to dog
-            elif self.labels[i] == self.cat_idx:
-                self.group_map[i] = 'cat'         # clean cat
-            elif self.labels[i] == self.dog_idx:
-                self.group_map[i] = 'dog'         # clean dog
-            else:
-                self.group_map[i] = 'other'       # other classes
+        self.noisy_labels = self.labels.copy()
+        for idx in noisy_indices:
+            true_label = self.labels[idx]
+            # choose a different class uniformly at random
+            choices = list(range(self.num_classes))
+            choices.remove(true_label)
+            self.noisy_labels[idx] = int(rng.choice(choices))
 
-        print(f"[Noise] Flipped exactly {self.n_flip} cats → dog.")
+        # Report actual ratio
+        num_diff = sum(int(a != b) for a, b in zip(self.labels, self.noisy_labels))
+        print(f"Actual label noise ratio: {num_diff/n:.2%} (Target: {self.noise_ratio:.2%})")
 
-    def __len__(self): return len(self.base)
+    def __len__(self):
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        x, _true = self.base[idx]
-        label = int(self.noisy_labels[idx])
-        is_noisy = bool(self.noisy_mask[idx])
-        return x, label, int(idx), is_noisy
+        img, _ = self.dataset[idx]                 # ignore original label
+        return img, int(self.noisy_labels[idx]), int(idx), bool(self.noisy_mask[idx])
 
 # =================== LID Estimators ===================
 class LIDEstimators:
@@ -353,9 +331,14 @@ def get_phi_for_indices(distance_queues, indices, k_required):
 # =================== Training & logging ===============
 def train_model(model, train_loader, test_loader, num_epochs, k, device):
     """
-    If USE_CKL is False: trains with plain CE (baseline).
-    If USE_CKL is True : trains with online Bayes-GIE -> CKL -> class-wise alpha_i -> D2L soft targets.
+    Minimal change version:
+    - Warm-up with plain CE for WARMUP_EPOCHS (set = k to fill the phi window).
+    - Still RECORD per-sample CE history during warm-up (distance_queues & G_global).
+    - After warm-up, run your original Bayes-GIE -> CKL -> alpha -> D2L pipeline.
+
     """
+    WARMUP_EPOCHS = k  # wait until each sample has ~k CE points
+
     model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
     per_sample_ce = nn.CrossEntropyLoss(reduction='none')
@@ -363,7 +346,7 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
 
     loss_history, test_loss_history = [], []
 
-    # ---------- CKL/Bayes-GIE state (only if enabled) ----------
+    # ---------- CKL/Bayes-GIE state ----------
     if USE_CKL:
         lid = LIDEstimators(device=device)
         distance_queues: dict[int, deque] = {}    # idx -> deque[float] of length k
@@ -371,6 +354,13 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
         cum_den_bgie: dict[int, float] = defaultdict(float)
         runlen_global: dict[int, int] = defaultdict(int)  # persists across epochs
         G_global = deque(maxlen=k)                        # global train-loss reference (length k)
+    else:
+        lid = None
+        distance_queues = {}
+        cum_num_bgie = {}
+        cum_den_bgie = {}
+        runlen_global = {}
+        G_global = deque(maxlen=k)
 
     for epoch in range(num_epochs):
         model.train()
@@ -380,6 +370,8 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
         if USE_CKL:
             tracker = ClassCklTracker(num_classes=10, thr_mode="mean", min_run=5)
             tracker.runlen = runlen_global
+        else:
+            tracker = None
 
         for batch_idx, (inputs, labels, indices, is_noisy) in enumerate(train_loader):
             inputs, labels = inputs.to(device), labels.to(device)
@@ -388,8 +380,22 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
             # forward
             logits = model(inputs)
 
-            # ===== Baseline: no CKL/Bayes-GIE =====
-            if not USE_CKL:
+            # --- ALWAYS record per-sample CE history (even during warm-up) ---
+            if USE_CKL:
+                ce_vec = per_sample_ce(logits, labels).detach().cpu().numpy()
+                batch_mean_ce = float(np.mean(ce_vec))
+                G_global.append(batch_mean_ce)
+
+                for i, idx in enumerate(indices_np):
+                    dq = distance_queues.get(int(idx))
+                    if dq is None:
+                        dq = deque(maxlen=k)
+                        distance_queues[int(idx)] = dq
+                    dq.append(float(ce_vec[i]))
+            # ----------------------------------------------------------------
+
+            # ===== Warm-up: optimize CE only (no CKL/D2L used yet) =====
+            if (not USE_CKL) or (epoch < WARMUP_EPOCHS):
                 loss = global_ce(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()
@@ -398,21 +404,9 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                 running_loss_sum += float(loss.detach().cpu()) * labels.size(0)
                 running_count    += int(labels.numel())
                 continue
-            # ======================================
+            # ============================================================
 
-            # per-sample CE (used for phi and warmup)
-            ce_vec = per_sample_ce(logits, labels).detach().cpu().numpy()
-            batch_mean_ce = float(np.mean(ce_vec))
-            G_global.append(batch_mean_ce)
-
-            # update phi windows BEFORE Bayes-GIE
-            for i, idx in enumerate(indices_np):
-                dq = distance_queues.get(int(idx))
-                if dq is None:
-                    dq = deque(maxlen=k)
-                    distance_queues[int(idx)] = dq
-                dq.append(float(ce_vec[i]))
-
+            # ----------------- CKL/D2L branch (unchanged logic) -----------------
             # collect phi (None if not enough history)
             phi_list = get_phi_for_indices(distance_queues, indices_np, k_required=k)
 
@@ -487,7 +481,7 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                         a_c = ckl_to_alpha(ckl_vals[sel], tracker.current_thr_val(c), kappa=3.0, alpha_floor=0.05)
                         alphas_np[sel] = a_c
 
-            # hard clamp if gated
+            # hard clamp if gated (original behavior)
             alphas_np = np.where(gated, 0.05, alphas_np)
             alphas = torch.tensor(alphas_np, device=device, dtype=logits.dtype)
 
@@ -510,6 +504,7 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
 
             running_loss_sum += float(loss.detach().cpu()) * labels.size(0)
             running_count    += int(labels.numel())
+            # ----------------- end CKL/D2L branch -----------------
 
         # epoch metrics
         loss_history.append(running_loss_sum / max(running_count, 1))
@@ -538,11 +533,12 @@ def main():
         transforms.Normalize((0.4914,0.4822,0.4465), (0.2023,0.1994,0.2010)),
     ])
 
+    NOISE_RATE = 0.40   
+
     train_set_raw = torchvision.datasets.CIFAR10(root='./data', train=True,  download=True, transform=transform)
     test_set      = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
 
-    # single dataset with exactly 100 cat→dog flips
-    train_set = ControlledCatDogNoise(train_set_raw, n_flip=N_CATS_FLIP, seed=FLIP_SEED)
+    train_set = NoisyLabelCIFAR10(train_set_raw, noise_ratio=NOISE_RATE, num_classes=10, seed=FLIP_SEED)
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
     test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False)

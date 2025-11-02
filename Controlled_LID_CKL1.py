@@ -24,12 +24,112 @@ K_WINDOW     = 22          # sliding window for FIE/GIE
 FLIP_SEED    = 777         # which cats get flipped to dog
 N_CATS_FLIP  = 100         # exactly 100 cats → dog
 MIN_RUNS = 5 
-STICKY_FLAG = True         # True = once flagged, stays True; False = can turn back to False
+STICKY_FLAG = True        # True = once flagged, stays True; False = can turn back to False
 KAPPA = 1.0
 ALPHA_FLOOR = 0.05
 USE_CKL      = True        # True = CKL+α (NSES), False = plain CE baseline
 
 EPS = 1e-12
+
+
+import hashlib
+from contextlib import contextmanager
+
+def _is_bn(m):
+    return isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))
+
+def snapshot_bn_state(model):
+    """
+    Returns {module_name: {
+        'running_mean': tensor(cpu).clone(),
+        'running_var':  tensor(cpu).clone(),
+        'num_batches_tracked': int or None,
+        'track_running_stats': bool
+    }}
+    """
+    snap = {}
+    for name, m in model.named_modules():
+        if _is_bn(m):
+            d = {
+                "running_mean": m.running_mean.detach().cpu().clone() if m.running_mean is not None else None,
+                "running_var":  m.running_var.detach().cpu().clone()  if m.running_var  is not None else None,
+                "num_batches_tracked": int(m.num_batches_tracked.item()) if hasattr(m, "num_batches_tracked") else None,
+                "track_running_stats": bool(getattr(m, "track_running_stats", False)),
+            }
+            snap[name] = d
+    return snap
+
+def _max_abs_diff(a, b):
+    if a is None or b is None:
+        return None
+    return float((a - b).abs().max().item())
+
+def compare_bn_snapshots(s0, s1, atol=0.0, quiet_ok=True):
+    """
+    Prints any BN modules whose stats changed beyond atol.
+    Returns True if all BN stats are unchanged within atol, else False.
+    """
+    ok = True
+    for name in sorted(set(s0.keys()) | set(s1.keys())):
+        if name not in s0 or name not in s1:
+            print(f"[BN-CHECK] Module presence changed for '{name}' (before/after).")
+            ok = False
+            continue
+        a, b = s0[name], s1[name]
+        dm = _max_abs_diff(a["running_mean"], b["running_mean"])
+        dv = _max_abs_diff(a["running_var"],  b["running_var"])
+        dnbt = None
+        if a["num_batches_tracked"] is not None and b["num_batches_tracked"] is not None:
+            dnbt = b["num_batches_tracked"] - a["num_batches_tracked"]
+
+        changed = False
+        lines = []
+        if dm is not None and (dm > atol):
+            changed = True; lines.append(f"running_mean Δmax={dm:.3e}")
+        if dv is not None and (dv > atol):
+            changed = True; lines.append(f"running_var  Δmax={dv:.3e}")
+        if dnbt is not None and dnbt != 0:
+            changed = True; lines.append(f"num_batches_tracked Δ={dnbt}")
+
+        if changed:
+            ok = False
+            print(f"[BN-CHECK] '{name}': " + ", ".join(lines))
+
+    if ok and not quiet_ok:
+        print("[BN-CHECK] All BN running stats unchanged (within atol).")
+    return ok
+
+def model_param_fingerprint(model):
+    """Lightweight fingerprint to help ensure you're running the intended file/model."""
+    h = hashlib.sha1()
+    with torch.no_grad():
+        for p in model.parameters():
+            h.update(p.detach().cpu().numpy().tobytes())
+    return h.hexdigest()[:12]
+
+@contextmanager
+def bn_guard(model, label="PROBE", atol=0.0):
+    """
+    Context that asserts BN stats don’t change inside the block.
+    Use around your probe forward loop.
+    """
+    print(f"\n[BN-CHECK:{label}] entering… training={model.training}, grad_enabled={torch.is_grad_enabled()}")
+    before = snapshot_bn_state(model)
+    fp_before = model_param_fingerprint(model)
+    try:
+        yield
+    finally:
+        after = snapshot_bn_state(model)
+        fp_after = model_param_fingerprint(model)
+        print(f"[BN-CHECK:{label}] leaving…  training={model.training}, grad_enabled={torch.is_grad_enabled()}")
+        same = compare_bn_snapshots(before, after, atol=atol, quiet_ok=False)
+        print(f"[BN-CHECK:{label}] param fingerprint (before/after): {fp_before} → {fp_after}")
+        if not same:
+            print(f"[BN-CHECK:{label}] ❌ BN stats changed! Ensure model.eval() was set for the probe and no hidden training ops ran.")
+        else:
+            print(f"[BN-CHECK:{label}] ✅ BN stats unchanged.")
+
+
 
 # =================== Determinism ======================
 def set_all_seeds(seed=SEED):
@@ -262,6 +362,8 @@ def save_pairs_to_file(pairs_dict, filename):
         json.dump(serializable, fp, indent=2)
 
 def compute_accuracy(model, data_loader, device):
+    was_training = model.training
+
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
@@ -271,7 +373,9 @@ def compute_accuracy(model, data_loader, device):
             _, predicted = torch.max(outputs.data, 1)
             correct += (predicted == labels).sum().item()
             total   += labels.size(0)
-    model.train()
+    if was_training:
+        model.train()
+        
     return 100 * correct / max(total, 1)
 
 def huber_mean(x, c=1.345, iters=15):
@@ -330,191 +434,143 @@ def per_class_accuracy(model, data_loader, device, class_ids, true_labels_array=
     acc = {c: (100.0 * counts[c][0] / max(counts[c][1], 1)) for c in class_ids}
     return acc
 
+
+@torch.no_grad()
+def subset_accuracy(model, data_loader, device, index_mask: np.ndarray,
+                    use_true_labels: bool = False,
+                    true_labels_array: np.ndarray | None = None) -> float:
+    """
+    Accuracy on a subset of the TRAIN set specified by a boolean index_mask
+    (len == len(train_loader.dataset)). If use_true_labels=True, compare
+    against the original CIFAR-10 labels (true_labels_array required).
+    Otherwise, compare against the observed/noisy labels from the loader.
+    """
+    model.eval()
+    correct, total = 0, 0
+    for batch in data_loader:
+        inputs = batch[0].to(device)
+        batch_indices = batch[2].cpu().numpy()  # global indices into the train dataset
+        sel = index_mask[batch_indices]
+        if not np.any(sel):
+            continue
+
+        # choose labels
+        if use_true_labels:
+            assert true_labels_array is not None, "true_labels_array is required when use_true_labels=True"
+            labels = torch.tensor(true_labels_array[batch_indices], device=device, dtype=torch.long)
+        else:
+            labels = batch[1].to(device)  # observed/noisy labels from the loader
+
+        logits = model(inputs)
+        preds = torch.argmax(logits, dim=1)
+
+        # restrict to the selected subset
+        sel_t = torch.from_numpy(sel).to(device=device, dtype=torch.bool)
+        correct += (preds[sel_t] == labels[sel_t]).sum().item()
+        total   += int(sel_t.sum().item())
+
+    model.train()
+    return 100.0 * correct / max(total, 1)
+
+
 # =================== Training & logging ===============
 def train_model(model, train_loader, test_loader, num_epochs, k, device):
-    print("=== Mode:", "CKL+α(NSES)" if USE_CKL else "Baseline CE", "===")
-
     model = model.to(device)
 
     # ---- Optimizer & losses ----
     optimizer      = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
-    ce_hard_vec    = nn.CrossEntropyLoss(reduction='none')  # per-sample (probe or baseline train)
-    ce_hard_mean   = nn.CrossEntropyLoss()                  # scalar (baseline train or test)
-    ce_test_mean   = nn.CrossEntropyLoss()                  # scalar (test)
+    ce_hard_vec    = nn.CrossEntropyLoss(reduction='none')   # per-sample (for queues & baseline loss)
+    ce_hard_mean   = nn.CrossEntropyLoss()                   # scalar (baseline loss)
+    ce_test_mean   = nn.CrossEntropyLoss()                   # scalar (test)
 
     # ---- Buffers & state ----
-    distance_queues = {}  # idx -> deque of (hard-CE loss, epoch)  (only used when USE_CKL)
-    probe_loss_history, train_loss_history, test_loss_history = [], [], []
-    lid = LIDEstimators(device=device)
+    distance_queues = {}   # idx -> deque of (hard-CE loss, epoch)
+    epoch_ce_mean   = []   # store mean hard CE per epoch (for G-trace)
+    train_loss_history, test_loss_history = [], []
 
     n_samples   = len(train_loader.dataset)
     num_classes = len(train_loader.dataset.base.classes)
 
     # For CKL path only
-    above_streak  = defaultdict(int)                # idx -> consecutive "above mean" count
-    flagged_noisy = np.zeros(n_samples, dtype=bool) # sticky or non-sticky depending on STICKY_FLAG
-    alpha_buffer  = np.full(n_samples, np.nan, dtype=np.float32)  # α used to build y*
+    above_streak  = defaultdict(int)                 # idx -> consecutive "above mean" count
+    flagged_noisy = np.zeros(n_samples, dtype=bool)  # sticky or non-sticky depending on STICKY_FLAG
+    alpha_buffer  = np.full(n_samples, np.nan, dtype=np.float32)  # α used for NEXT epoch
+    lid = LIDEstimators(device=device)
 
     if USE_CKL:
         assert MIN_RUNS <= k, "MIN_RUNS should be <= K_WINDOW"
         assert num_epochs >= k, "Need at least K_WINDOW epochs to start detection"
-        print("===== CKL Mode:", "Sticky =====" if STICKY_FLAG else "No-Sticky =====")
 
     for epoch in range(num_epochs):
-
         # =========================================================
-        # 1) (Optional) PROBE PASS for CKL: collect hard-label CE
-        # =========================================================
-        alpha_this_epoch = {}  # idx -> α (only for samples seen/flagged this epoch)
-        if USE_CKL:
-            model.eval()
-            probe_sum, probe_cnt = 0.0, 0
-            with torch.no_grad():
-                for inputs, labels, indices, _ in train_loader:
-                    inputs, labels = inputs.to(device), labels.to(device)
-                    logits = model(inputs)
-                    losses_vec = ce_hard_vec(logits, labels)  # hard CE, NOT α-mixed
-
-                    probe_sum += float(losses_vec.sum().cpu())
-                    probe_cnt += int(labels.numel())
-
-                    # maintain k-window of probe losses per sample
-                    for i in range(len(indices)):
-                        idx = int(indices[i])
-                        if idx not in distance_queues:
-                            distance_queues[idx] = deque(maxlen=k)
-                        distance_queues[idx].append((float(losses_vec[i].cpu()), epoch))
-
-            probe_epoch_loss = probe_sum / max(probe_cnt, 1)
-            probe_loss_history.append(probe_epoch_loss)
-
-            # =========================================================
-            # 2) DETECTION: compute GIE/CKL; update flags and α for THIS epoch
-            # =========================================================
-            if epoch >= k - 1:
-                # Build class-wise refs for d and W using log-Huber on GIE/W (robust center),
-                # but compare CKL to class arithmetic mean.
-                per_cls_log_gie = {c: [] for c in range(num_classes)}
-                per_cls_log_w   = {c: [] for c in range(num_classes)}
-                sample_stats    = {}  # idx -> (gie_tr, w_tr, cls)
-
-                # First pass: per-sample GIE/W using probe history and probe epoch means
-                for idx, dq in distance_queues.items():
-                    if len(dq) < k:
-                        continue
-                    dists, epochs_ = zip(*dq)
-                    phi  = np.asarray(dists, dtype=float)
-                    G_tr = np.asarray([probe_loss_history[e] for e in epochs_], dtype=float)
-
-                    gie_tr, w_tr = lid.compute_GIE_LID(phi, G_tr)
-                    cls = int(train_loader.dataset.noisy_labels[idx])
-
-                    if np.isfinite(gie_tr) and gie_tr > 0.0:
-                        per_cls_log_gie[cls].append(np.log(max(gie_tr, EPS)))
-                    if np.isfinite(w_tr) and w_tr > 0.0:
-                        per_cls_log_w[cls].append(np.log(max(w_tr, EPS)))
-
-                    sample_stats[idx] = (gie_tr, w_tr, cls)
-
-                # Class refs
-                cls_log_gie_huber = [huber_mean(per_cls_log_gie[c]) if per_cls_log_gie[c] else float('nan')
-                                     for c in range(num_classes)]
-                cls_log_w_huber   = [huber_mean(per_cls_log_w[c])   if per_cls_log_w[c]   else float('nan')
-                                     for c in range(num_classes)]
-                ref_d = [math.exp(v) if np.isfinite(v) else np.nan for v in cls_log_gie_huber]
-                ref_w = [math.exp(v) if np.isfinite(v) else np.nan for v in cls_log_w_huber]
-
-                # CKL per sample (vs class refs)
-                per_cls_ckl = {c: [] for c in range(num_classes)}
-                sample_ckl  = {}  # idx -> (ckl_val, cls)
-                for idx, (gie_tr, w_tr, cls) in sample_stats.items():
-                    if not (np.isfinite(gie_tr) and gie_tr > 0.0 and np.isfinite(w_tr) and w_tr > 0.0):
-                        continue
-                    d2, w2 = ref_d[cls], ref_w[cls]
-                    if not (np.isfinite(d2) and d2 > 0.0 and np.isfinite(w2) and w2 > 0.0):
-                        continue
-                    ckl_val = ckl_finite(w_tr, gie_tr, w2, d2)
-                    if np.isfinite(ckl_val):
-                        per_cls_ckl[cls].append(float(ckl_val))
-                        sample_ckl[idx] = (float(ckl_val), cls)
-
-                # Arithmetic mean CKL per class
-                cls_ckl_mean = [(float(np.mean(per_cls_ckl[c])) if per_cls_ckl[c] else float('nan'))
-                                for c in range(num_classes)]
-
-                # Update streaks/flags; compute α for flagged
-                for idx, (val, cls) in sample_ckl.items():
-                    mean_c = cls_ckl_mean[cls]
-                    if not np.isfinite(mean_c):
-                        continue
-
-                    # streaks
-                    if val > mean_c:
-                        above_streak[idx] += 1
-                    else:
-                        above_streak[idx] = 0
-
-                    # sticky vs non-sticky flag
-                    if STICKY_FLAG:
-                        if above_streak[idx] >= MIN_RUNS:
-                            flagged_noisy[idx] = True
-                    else:
-                        flagged_noisy[idx] = (above_streak[idx] >= MIN_RUNS)
-
-                    # α for this epoch (only if flagged right now)
-                    if flagged_noisy[idx]:
-                        alpha_val = float(ckl_to_alpha(val, mean_c, kappa=KAPPA, alpha_floor=ALPHA_FLOOR))
-                        alpha_this_epoch[idx] = alpha_val
-
-                # Update α buffer for TRAIN pass this SAME epoch
-                for idx, a in alpha_this_epoch.items():
-                    alpha_buffer[idx] = a
-
-                if not STICKY_FLAG:
-                    seen = set(sample_ckl.keys())
-                    for idx in seen:
-                        if not flagged_noisy[idx]:
-                            alpha_buffer[idx] = np.nan
-                    for idx in np.where(~flagged_noisy)[0]:
-                        if idx not in seen:
-                            alpha_buffer[idx] = np.nan
-
-                # Diagnostic: dog flagged correctness
-                dog_idx = train_loader.dataset.dog_idx
-                flagged_idxs = np.where(flagged_noisy)[0]
-                dog_flagged = [i for i in flagged_idxs if int(train_loader.dataset.noisy_labels[i]) == dog_idx]
-                correct = sum(1 for i in dog_flagged if train_loader.dataset.group_map.get(i) == 'noisy')
-                incorrect = sum(1 for i in dog_flagged if train_loader.dataset.group_map.get(i) == 'dog')
-                print(f"[Epoch {epoch+1}] Dog flagged: total={len(dog_flagged)}, correct={correct}, incorrect={incorrect}")
-
-        # =========================================================
-        # 3) TRAIN PASS
-        #    - CKL path: α-mixed “NSES” loss with y* = α y + (1-α) ŷ
-        #    - Baseline: plain hard-label CE
+        # 1) TRAIN (single pass)
+        #    - Always compute per-sample hard CE (for queues).
+        #    - Loss:
+        #         * Baseline or CKL with flagged-only α
         # =========================================================
         model.train()
         train_sum, train_cnt = 0.0, 0
+        ce_sum_for_epoch, ce_cnt_for_epoch = 0.0, 0
+
         for inputs, labels, indices, _ in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             logits = model(inputs)
 
-            if USE_CKL:
-                # ŷ (stop-grad in target path) and one-hot y
-                probs = F.softmax(logits, dim=1).detach()
-                yhard = one_hot(labels, num_classes=num_classes, device=device)
+            # (A) Per-sample hard CE for queues & baseline
+            ce_vec = ce_hard_vec(logits, labels)  # shape [B]
+            # enqueue for GIE history (use current epoch index)
+            for i in range(len(indices)):
+                idx = int(indices[i])
+                if idx not in distance_queues:
+                    distance_queues[idx] = deque(maxlen=k)
+                distance_queues[idx].append((float(ce_vec[i].detach().cpu()), epoch))
 
-                # α for these indices (default 1.0 if NaN)
-                a_list = [alpha_buffer[int(i)] if not np.isnan(alpha_buffer[int(i)]) else 1.0 for i in indices]
-                alphas = torch.tensor(a_list, device=device, dtype=torch.float32).unsqueeze(1)
+            # accumulate epoch mean hard CE (for G trace)
+            ce_sum_for_epoch += float(ce_vec.sum().detach().cpu())
+            ce_cnt_for_epoch += int(labels.numel())
 
-                # y* and “NSES” loss = - Σ y* log ŷθ
-                ystar = alphas * yhard + (1.0 - alphas) * probs
-                logp  = F.log_softmax(logits, dim=1)
-                loss_vec = -(ystar * logp).sum(dim=1)
-                loss = loss_vec.mean()
+            # (B) Compute loss
+            if not USE_CKL:
+                # Plain baseline: mean hard CE
+                loss = ce_vec.mean()
             else:
-                # Plain CE baseline
-                loss = ce_hard_mean(logits, labels)
+                # CKL mode, flagged-only α:
+                with torch.no_grad():
+                    # mask of currently flagged (α available from *previous* epoch’s detection)
+                    idx_np = np.asarray(indices.cpu().numpy(), dtype=int)
+                    a_np   = np.array([alpha_buffer[i] for i in idx_np])
+                    flagged_mask = ~np.isnan(a_np) & (a_np < 1.0 - 1e-12)
+                    a_flag = torch.tensor(a_np[flagged_mask], device=device, dtype=torch.float32).unsqueeze(1)
+
+                if flagged_mask.any():
+                    # Split batch into flagged / unflagged
+                    flagged_idx   = torch.where(torch.tensor(flagged_mask, device=device))[0]
+                    unflagged_idx = torch.where(~torch.tensor(flagged_mask, device=device))[0]
+
+                    # Unflagged part: plain CE
+                    loss_unflag = ce_vec[unflagged_idx].mean() if unflagged_idx.numel() > 0 else 0.0
+
+                    # Flagged part: NSES with y* = α y + (1-α) ŷ
+                    logits_flag = logits[flagged_idx]
+                    labels_flag = labels[flagged_idx]
+                    probs_flag  = F.softmax(logits_flag, dim=1).detach()
+                    yhard_flag  = one_hot(labels_flag, num_classes=num_classes, device=device)
+                    ystar_flag  = a_flag * yhard_flag + (1.0 - a_flag) * probs_flag
+                    logp_flag   = F.log_softmax(logits_flag, dim=1)
+                    loss_flag   = -(ystar_flag * logp_flag).sum(dim=1).mean()
+
+                    # Combine
+                    if unflagged_idx.numel() > 0:
+                        #loss = 0.5 * loss_unflag + 0.5 * loss_flag  # or weighted by counts
+                        n_flag = flagged_idx.numel()
+                        n_unfl = unflagged_idx.numel()
+                        loss = (loss_unflag * n_unfl + loss_flag * n_flag) / (n_unfl + n_flag)
+
+                    else:
+                        loss = loss_flag
+                else:
+                    # No flagged samples in this batch => plain CE
+                    loss = ce_vec.mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -523,11 +579,14 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
             train_sum += float(loss.detach().cpu()) * labels.size(0)
             train_cnt += int(labels.numel())
 
+        # Finish mean CE for this epoch (for G-trace)
+        epoch_ce_mean.append(ce_sum_for_epoch / max(ce_cnt_for_epoch, 1))
+
         train_epoch_loss = train_sum / max(train_cnt, 1)
         train_loss_history.append(train_epoch_loss)
 
         # =========================================================
-        # 4) TEST (hard-label CE)
+        # 2) TEST (hard-label CE)
         # =========================================================
         model.eval()
         t_sum, t_cnt = 0.0, 0
@@ -545,8 +604,7 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
 
         if USE_CKL:
             print(f"Epoch [{epoch+1}/{num_epochs}] "
-                  f"ProbeCE={probe_loss_history[-1]:.4f}  "
-                  f"TrainLoss(y*)={train_loss_history[-1]:.4f}  "
+                  f"TrainLoss={train_loss_history[-1]:.4f}  "
                   f"TestCE={test_loss_history[-1]:.4f}  "
                   f"TrainAcc={train_acc:.2f}%  TestAcc={test_acc:.2f}%")
         else:
@@ -558,23 +616,126 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
         # ---- Per-class accuracies (all 10) ----
         class_ids   = list(range(num_classes))
         class_names = train_loader.dataset.base.classes
-
-        # Train per-class using observed (noisy) labels
         train_obs_acc = per_class_accuracy(model, train_loader, device, class_ids, true_labels_array=None)
-        # Train per-class using *true labels* (original CIFAR-10 via indices)
         train_true_labels = np.array(train_loader.dataset.labels, dtype=int)
         train_true_acc = per_class_accuracy(model, train_loader, device, class_ids, true_labels_array=train_true_labels)
-        # Test per-class (clean)
         test_acc_per_class = per_class_accuracy(model, test_loader, device, class_ids, true_labels_array=None)
 
         def _print_classwise(title, acc_dict):
             print(f"  {title}")
             for c in class_ids:
                 print(f"    [{c}] {class_names[c]:>10}: {acc_dict[c]:6.2f}%")
-
         _print_classwise("Train (observed labels)", train_obs_acc)
         _print_classwise("Train (true labels)    ", train_true_acc)
         _print_classwise("Test (clean)           ", test_acc_per_class)
+        
+        # ---- Noisy-subset train accuracies ----
+        noisy_mask = train_loader.dataset.noisy_mask              # boolean array (flipped cat->dog)
+        true_labels_array = np.array(train_loader.dataset.labels) # original CIFAR-10 true labels
+        
+        noisy_train_acc_observed = subset_accuracy(
+            model, train_loader, device, noisy_mask, use_true_labels=False
+        )
+        noisy_train_acc_true = subset_accuracy(
+            model, train_loader, device, noisy_mask, use_true_labels=True, true_labels_array=true_labels_array
+        )
+        
+        print(f"  Train (noisy subset) — observed labels: {noisy_train_acc_observed:5.2f}%")
+        print(f"  Train (noisy subset) — true labels    : {noisy_train_acc_true:5.2f}%")
+
+
+        # =========================================================
+        # 3) DETECTION (runs AFTER training; α applies NEXT epoch)
+        #    Uses CE history up to *this* epoch (no extra forward).
+        # =========================================================
+        if USE_CKL and epoch >= k - 1:
+            # Build refs per class from last k points in each deque
+            per_cls_log_gie = {c: [] for c in range(num_classes)}
+            per_cls_log_w   = {c: [] for c in range(num_classes)}
+            sample_stats    = {}  # idx -> (gie_tr, w_tr, cls)
+
+            for idx, dq in distance_queues.items():
+                if len(dq) < k:
+                    continue
+                dists, epochs_ = zip(*dq)
+                phi  = np.asarray(dists, dtype=float)
+                G_tr = np.asarray([epoch_ce_mean[e] for e in epochs_], dtype=float)
+
+                gie_tr, w_tr = lid.compute_GIE_LID(phi, G_tr)
+                cls = int(train_loader.dataset.noisy_labels[idx])
+
+                if np.isfinite(gie_tr) and gie_tr > 0.0:
+                    per_cls_log_gie[cls].append(np.log(max(gie_tr, EPS)))
+                if np.isfinite(w_tr) and w_tr > 0.0:
+                    per_cls_log_w[cls].append(np.log(max(w_tr, EPS)))
+
+                sample_stats[idx] = (gie_tr, w_tr, cls)
+
+            cls_log_gie_huber = [huber_mean(per_cls_log_gie[c]) if per_cls_log_gie[c] else float('nan')
+                                 for c in range(num_classes)]
+            cls_log_w_huber   = [huber_mean(per_cls_log_w[c])   if per_cls_log_w[c]   else float('nan')
+                                 for c in range(num_classes)]
+            ref_d = [math.exp(v) if np.isfinite(v) else np.nan for v in cls_log_gie_huber]
+            ref_w = [math.exp(v) if np.isfinite(v) else np.nan for v in cls_log_w_huber]
+
+            per_cls_ckl = {c: [] for c in range(num_classes)}
+            sample_ckl  = {}
+            for idx, (gie_tr, w_tr, cls) in sample_stats.items():
+                if not (np.isfinite(gie_tr) and gie_tr > 0.0 and np.isfinite(w_tr) and w_tr > 0.0):
+                    continue
+                d2, w2 = ref_d[cls], ref_w[cls]
+                if not (np.isfinite(d2) and d2 > 0.0 and np.isfinite(w2) and w2 > 0.0):
+                    continue
+                ckl_val = ckl_finite(w_tr, gie_tr, w2, d2)
+                if np.isfinite(ckl_val):
+                    per_cls_ckl[cls].append(float(ckl_val))
+                    sample_ckl[idx] = (float(ckl_val), cls)
+
+            cls_ckl_mean = [huber_mean(per_cls_ckl[c]) if per_cls_ckl[c] else float('nan')
+                            for c in range(num_classes)]
+                            
+            #cls_ckl_mean = [(float(np.mean(per_cls_ckl[c])) if per_cls_ckl[c] else float('nan'))
+            #                for c in range(num_classes)]
+
+            # Update streaks/flags (affects α for NEXT epoch)
+            for idx, (val, cls) in sample_ckl.items():
+                mean_c = cls_ckl_mean[cls]
+                if not np.isfinite(mean_c):
+                    continue
+                if val > mean_c:
+                    above_streak[idx] += 1
+                else:
+                    above_streak[idx] = 0
+
+                if STICKY_FLAG:
+                    if above_streak[idx] >= MIN_RUNS:
+                        flagged_noisy[idx] = True
+                else:
+                    flagged_noisy[idx] = (above_streak[idx] >= MIN_RUNS)
+
+            # Prepare α for NEXT epoch only
+            new_alpha = np.full_like(alpha_buffer, np.nan, dtype=np.float32)
+            for idx, (val, cls) in sample_ckl.items():
+                mean_c = cls_ckl_mean[cls]
+                if flagged_noisy[idx] and np.isfinite(mean_c):
+                    new_alpha[idx] = float(ckl_to_alpha(val, mean_c, kappa=KAPPA, alpha_floor=ALPHA_FLOOR))
+
+            if STICKY_FLAG:
+                # keep existing α for already-flagged if new is NaN
+                keep = np.isnan(new_alpha) & (alpha_buffer < 1.0)
+                new_alpha[keep] = alpha_buffer[keep]
+
+            alpha_buffer = new_alpha
+
+            # Optional diagnostic: dog flagged counts (NEXT epoch α will apply)
+            dog_idx = train_loader.dataset.dog_idx
+            flagged_idxs = np.where(flagged_noisy)[0]
+            dog_flagged = [i for i in flagged_idxs if int(train_loader.dataset.noisy_labels[i]) == dog_idx]
+            correct = sum(1 for i in dog_flagged if train_loader.dataset.group_map.get(i) == 'noisy')
+            incorrect = sum(1 for i in dog_flagged if train_loader.dataset.group_map.get(i) == 'dog')
+            print(f"[Post-Epoch {epoch+1}] (for next epoch) Dog flagged: total={len(dog_flagged)}, "
+                  f"correct={correct}, incorrect={incorrect}")
+
 
 # =================== Main =============================
 def main():
@@ -592,6 +753,7 @@ def main():
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
     test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False)
+    probe_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=False)
 
     model = ResNet32()
     train_model(model, train_loader, test_loader, NUM_EPOCHS, K_WINDOW, device)

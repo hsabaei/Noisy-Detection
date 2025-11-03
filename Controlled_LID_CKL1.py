@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision
 import torchvision.transforms as transforms
 import math
+from typing import Optional
 
 # ======================= Config =======================
 SEED = 12345
@@ -22,12 +23,12 @@ WEIGHT_DECAY = 0.0
 
 K_WINDOW     = 22          # sliding window for FIE/GIE
 FLIP_SEED    = 777         # which cats get flipped to dog
-N_CATS_FLIP  = 100         # exactly 100 cats → dog
+N_CATS_FLIP  = 0         # exactly 100 cats → dog
 MIN_RUNS = 5 
 STICKY_FLAG = True        # True = once flagged, stays True; False = can turn back to False
 KAPPA = 1.0
 ALPHA_FLOOR = 0.05
-USE_CKL      = True        # True = CKL+α (NSES), False = plain CE baseline
+USE_CKL      = False        # True = CKL+α (NSES), False = plain CE baseline
 
 EPS = 1e-12
 
@@ -189,6 +190,93 @@ class ResNet(nn.Module):
         return self.linear(out)
 
 def ResNet32(): return ResNet(BasicBlock, [5,5,5])
+
+# =================== Model (12-layer CNN) =================
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, p_drop=0.0):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn   = nn.BatchNorm2d(out_ch)
+        self.drop = nn.Dropout2d(p_drop) if p_drop > 0 else nn.Identity()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = F.relu(x, inplace=True)
+        x = self.drop(x)
+        return x
+
+class CNN12(nn.Module):
+    """
+    12 conv layers total: 3 stages × 4 conv each
+    Stage1: 64 channels (x4 conv)  -> MaxPool
+    Stage2: 128 channels (x4 conv) -> MaxPool
+    Stage3: 256 channels (x4 conv) -> MaxPool
+    Then GAP + linear classifier.
+    """
+    def __init__(self, num_classes=10, p_drop=0.1):
+        super().__init__()
+        c1, c2, c3 = 64, 128, 256
+
+        # Stage 1 (4 conv layers)
+        self.s1 = nn.Sequential(
+            ConvBlock(3,  c1, p_drop),
+            ConvBlock(c1, c1, p_drop),
+            ConvBlock(c1, c1, p_drop),
+            ConvBlock(c1, c1, p_drop),
+        )
+        # Stage 2 (4 conv layers)
+        self.s2 = nn.Sequential(
+            ConvBlock(c1, c2, p_drop),
+            ConvBlock(c2, c2, p_drop),
+            ConvBlock(c2, c2, p_drop),
+            ConvBlock(c2, c2, p_drop),
+        )
+        # Stage 3 (4 conv layers)
+        self.s3 = nn.Sequential(
+            ConvBlock(c2, c3, p_drop),
+            ConvBlock(c3, c3, p_drop),
+            ConvBlock(c3, c3, p_drop),
+            ConvBlock(c3, c3, p_drop),
+        )
+
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.classifier = nn.Linear(c3, num_classes)
+        self.penultimate = None
+
+        # Kaiming init
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.Linear):
+            nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                bound = 1 / math.sqrt(fan_in)
+                nn.init.uniform_(m.bias, -bound, bound)
+
+    def forward(self, x):
+        # Input: 3×32×32 (CIFAR-10)
+        x = self.s1(x)          # -> 64×32×32
+        x = self.pool(x)        # -> 64×16×16
+        x = self.s2(x)          # -> 128×16×16
+        x = self.pool(x)        # -> 128×8×8
+        x = self.s3(x)          # -> 256×8×8
+        x = self.pool(x)        # -> 256×4×4
+
+        # Global Average Pool to 1×1
+        x = F.adaptive_avg_pool2d(x, 1).view(x.size(0), -1)  # -> (B, 256)
+        self.penultimate = x
+        return self.classifier(x)
+
+def CNN12_Model():
+    return CNN12(num_classes=10)
 
 # =================== Controlled noise =================
 class ControlledCatDogNoise(Dataset):
@@ -435,10 +523,17 @@ def per_class_accuracy(model, data_loader, device, class_ids, true_labels_array=
     return acc
 
 
+from typing import Optional
+
 @torch.no_grad()
-def subset_accuracy(model, data_loader, device, index_mask: np.ndarray,
-                    use_true_labels: bool = False,
-                    true_labels_array: np.ndarray | None = None) -> float:
+def subset_accuracy(
+    model,
+    data_loader,
+    device,
+    index_mask: np.ndarray,
+    use_true_labels: bool = False,
+    true_labels_array: Optional[np.ndarray] = None
+) -> float:
     """
     Accuracy on a subset of the TRAIN set specified by a boolean index_mask
     (len == len(train_loader.dataset)). If use_true_labels=True, compare
@@ -454,24 +549,21 @@ def subset_accuracy(model, data_loader, device, index_mask: np.ndarray,
         if not np.any(sel):
             continue
 
-        # choose labels
         if use_true_labels:
             assert true_labels_array is not None, "true_labels_array is required when use_true_labels=True"
             labels = torch.tensor(true_labels_array[batch_indices], device=device, dtype=torch.long)
         else:
-            labels = batch[1].to(device)  # observed/noisy labels from the loader
+            labels = batch[1].to(device)  # observed/noisy labels
 
         logits = model(inputs)
         preds = torch.argmax(logits, dim=1)
 
-        # restrict to the selected subset
         sel_t = torch.from_numpy(sel).to(device=device, dtype=torch.bool)
         correct += (preds[sel_t] == labels[sel_t]).sum().item()
         total   += int(sel_t.sum().item())
 
     model.train()
     return 100.0 * correct / max(total, 1)
-
 
 # =================== Training & logging ===============
 def train_model(model, train_loader, test_loader, num_epochs, k, device):
@@ -630,8 +722,8 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
         _print_classwise("Test (clean)           ", test_acc_per_class)
         
         # ---- Noisy-subset train accuracies ----
-        noisy_mask = train_loader.dataset.noisy_mask              # boolean array (flipped cat->dog)
-        true_labels_array = np.array(train_loader.dataset.labels) # original CIFAR-10 true labels
+        noisy_mask = train_loader.dataset.noisy_mask
+        true_labels_array = np.array(train_loader.dataset.labels, dtype=int)
         
         noisy_train_acc_observed = subset_accuracy(
             model, train_loader, device, noisy_mask, use_true_labels=False
@@ -642,7 +734,6 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
         
         print(f"  Train (noisy subset) — observed labels: {noisy_train_acc_observed:5.2f}%")
         print(f"  Train (noisy subset) — true labels    : {noisy_train_acc_true:5.2f}%")
-
 
         # =========================================================
         # 3) DETECTION (runs AFTER training; α applies NEXT epoch)
@@ -755,7 +846,7 @@ def main():
     test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False)
     probe_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=False)
 
-    model = ResNet32()
+    model = CNN12_Model()
     train_model(model, train_loader, test_loader, NUM_EPOCHS, K_WINDOW, device)
 
 if __name__ == '__main__':

@@ -25,7 +25,7 @@ FLIP_SEED    = 777         # which cats get flipped to dog
 N_CATS_FLIP  = 100         # exactly 100 cats → dog
 MIN_RUNS = 5 
 STICKY_FLAG = True         # True = once flagged, stays True; False = can turn back to False
-KAPPA = 1.0
+KAPPA = 2.0
 ALPHA_FLOOR = 0.05
 USE_CKL      = True        # True = CKL+α (NSES), False = plain CE baseline
 
@@ -369,7 +369,7 @@ def per_class_accuracy(model, data_loader, device, class_ids, true_labels_array=
     return acc
 
 # =================== Training & logging ===============
-def train_model(model, train_loader, test_loader, num_epochs, k, device):
+def train_model(model, train_loader, test_loader, probe_loader, num_epochs, k, device):
     print("=== Mode:", "CKL+α(NSES)" if USE_CKL else "Baseline CE", "===")
 
     model = model.to(device)
@@ -408,7 +408,7 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
             model.eval()
             probe_sum, probe_cnt = 0.0, 0
             with torch.no_grad():
-                for inputs, labels, indices, _ in train_loader:
+                for inputs, labels, indices, _ in probe_loader: 
                     inputs, labels = inputs.to(device), labels.to(device)
                     logits = model(inputs)
                     losses_vec = ce_hard_vec(logits, labels)  # hard CE, NOT α-mixed
@@ -527,32 +527,54 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
 
         # =========================================================
         # 3) TRAIN PASS
-        #    - CKL path: α-mixed “NSES” loss with y* = α y + (1-α) ŷ
-        #    - Baseline: plain hard-label CE
+        #   - Always start from plain CE per-sample
+        #   - If USE_CKL: only replace losses for flagged samples with α<1
         # =========================================================
         model.train()
         train_sum, train_cnt = 0.0, 0
+
         for inputs, labels, indices, _ in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             logits = model(inputs)
 
+            # 3.a Plain CE per-sample (baseline for all)
+            ce_vec = ce_hard_vec(logits, labels)  # shape [B]
+
             if USE_CKL:
-                # ŷ (stop-grad in target path) and one-hot y
-                probs = F.softmax(logits, dim=1).detach()
-                yhard = one_hot(labels, num_classes=num_classes, device=device)
+                # Build mask of positions that have an α strictly less than 1.0 (i.e., flagged & softened)
+                a_list = []
+                flagged_mask_list = []
+                for i in indices:
+                    a = alpha_buffer[int(i)]
+                    if np.isnan(a):  # treat NaN as 1.0 (no change)
+                        a = 1.0
+                    a_list.append(a)
+                    flagged_mask_list.append(a < 1.0)
 
-                # α for these indices (default 1.0 if NaN)
-                a_list = [alpha_buffer[int(i)] if not np.isnan(alpha_buffer[int(i)]) else 1.0 for i in indices]
-                alphas = torch.tensor(a_list, device=device, dtype=torch.float32).unsqueeze(1)
+                alphas = torch.tensor(a_list, device=device, dtype=torch.float32).unsqueeze(1)  # [B,1]
+                flagged_mask = torch.tensor(flagged_mask_list, device=device, dtype=torch.bool) # [B]
 
-                # y* and “NSES” loss = - Σ y* log ŷθ
-                ystar = alphas * yhard + (1.0 - alphas) * probs
-                logp  = F.log_softmax(logits, dim=1)
-                loss_vec = -(ystar * logp).sum(dim=1)
-                loss = loss_vec.mean()
+                if flagged_mask.any():
+                    # Compute NSES only for the flagged subset
+                    probs = F.softmax(logits.detach(), dim=1)        # ŷ (stop-grad in target path)
+                    yhard = one_hot(labels, num_classes=num_classes, device=device)
+
+                    # y* for the whole batch (cheap), but we will only use it on flagged indices
+                    ystar = alphas * yhard + (1.0 - alphas) * probs  # [B,C]
+                    logp  = F.log_softmax(logits, dim=1)
+                    nses_vec = -(ystar * logp).sum(dim=1)            # [B]
+
+                    # Start from CE and override ONLY flagged positions
+                    loss_vec = ce_vec.clone()
+                    loss_vec[flagged_mask] = nses_vec[flagged_mask]
+                else:
+                    # Nobody flagged this batch → pure CE
+                    loss_vec = ce_vec
             else:
-                # Plain CE baseline
-                loss = ce_hard_mean(logits, labels)
+                # Baseline run → pure CE
+                loss_vec = ce_vec
+
+            loss = loss_vec.mean()
 
             optimizer.zero_grad()
             loss.backward()
@@ -563,6 +585,7 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
 
         train_epoch_loss = train_sum / max(train_cnt, 1)
         train_loss_history.append(train_epoch_loss)
+
 
         # =========================================================
         # 4) TEST (hard-label CE)
@@ -630,9 +653,10 @@ def main():
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
     test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False)
+    probe_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=False)
 
     model = CNN12_Model()
-    train_model(model, train_loader, test_loader, NUM_EPOCHS, K_WINDOW, device)
+    train_model(model, train_loader, test_loader, probe_loader, NUM_EPOCHS, K_WINDOW, device)
 
 if __name__ == '__main__':
     main()

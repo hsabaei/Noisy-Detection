@@ -569,6 +569,8 @@ def subset_accuracy(
 def train_model(model, train_loader, test_loader, num_epochs, k, device):
     model = model.to(device)
 
+    print("=== Mode:", "CKL+α(NSES)" if USE_CKL else "Baseline CE", "===")
+
     # ---- Optimizer & losses ----
     optimizer      = torch.optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
     ce_hard_vec    = nn.CrossEntropyLoss(reduction='none')   # per-sample (for queues & baseline loss)
@@ -592,6 +594,7 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
     if USE_CKL:
         assert MIN_RUNS <= k, "MIN_RUNS should be <= K_WINDOW"
         assert num_epochs >= k, "Need at least K_WINDOW epochs to start detection"
+        print("===== CKL Mode:", "Sticky =====" if STICKY_FLAG else "No-Sticky =====")
 
     for epoch in range(num_epochs):
         # =========================================================

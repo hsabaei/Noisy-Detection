@@ -1,4 +1,4 @@
-﻿import os, json
+﻿import json
 import numpy as np
 from collections import deque, defaultdict
 
@@ -23,7 +23,8 @@ WEIGHT_DECAY = 0.0
 
 K_WINDOW     = 22          # sliding window for FIE/GIE
 FLIP_SEED    = 777         # which cats get flipped to dog
-N_CATS_FLIP  = 0         # exactly 100 cats → dog
+N_CATS_FLIP  = 0         
+NOISE_RATIO  = 0.05
 MIN_RUNS = 5 
 STICKY_FLAG = True        # True = once flagged, stays True; False = can turn back to False
 KAPPA = 1.0
@@ -31,106 +32,6 @@ ALPHA_FLOOR = 0.05
 USE_CKL      = False        # True = CKL+α (NSES), False = plain CE baseline
 
 EPS = 1e-12
-
-
-import hashlib
-from contextlib import contextmanager
-
-def _is_bn(m):
-    return isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))
-
-def snapshot_bn_state(model):
-    """
-    Returns {module_name: {
-        'running_mean': tensor(cpu).clone(),
-        'running_var':  tensor(cpu).clone(),
-        'num_batches_tracked': int or None,
-        'track_running_stats': bool
-    }}
-    """
-    snap = {}
-    for name, m in model.named_modules():
-        if _is_bn(m):
-            d = {
-                "running_mean": m.running_mean.detach().cpu().clone() if m.running_mean is not None else None,
-                "running_var":  m.running_var.detach().cpu().clone()  if m.running_var  is not None else None,
-                "num_batches_tracked": int(m.num_batches_tracked.item()) if hasattr(m, "num_batches_tracked") else None,
-                "track_running_stats": bool(getattr(m, "track_running_stats", False)),
-            }
-            snap[name] = d
-    return snap
-
-def _max_abs_diff(a, b):
-    if a is None or b is None:
-        return None
-    return float((a - b).abs().max().item())
-
-def compare_bn_snapshots(s0, s1, atol=0.0, quiet_ok=True):
-    """
-    Prints any BN modules whose stats changed beyond atol.
-    Returns True if all BN stats are unchanged within atol, else False.
-    """
-    ok = True
-    for name in sorted(set(s0.keys()) | set(s1.keys())):
-        if name not in s0 or name not in s1:
-            print(f"[BN-CHECK] Module presence changed for '{name}' (before/after).")
-            ok = False
-            continue
-        a, b = s0[name], s1[name]
-        dm = _max_abs_diff(a["running_mean"], b["running_mean"])
-        dv = _max_abs_diff(a["running_var"],  b["running_var"])
-        dnbt = None
-        if a["num_batches_tracked"] is not None and b["num_batches_tracked"] is not None:
-            dnbt = b["num_batches_tracked"] - a["num_batches_tracked"]
-
-        changed = False
-        lines = []
-        if dm is not None and (dm > atol):
-            changed = True; lines.append(f"running_mean Δmax={dm:.3e}")
-        if dv is not None and (dv > atol):
-            changed = True; lines.append(f"running_var  Δmax={dv:.3e}")
-        if dnbt is not None and dnbt != 0:
-            changed = True; lines.append(f"num_batches_tracked Δ={dnbt}")
-
-        if changed:
-            ok = False
-            print(f"[BN-CHECK] '{name}': " + ", ".join(lines))
-
-    if ok and not quiet_ok:
-        print("[BN-CHECK] All BN running stats unchanged (within atol).")
-    return ok
-
-def model_param_fingerprint(model):
-    """Lightweight fingerprint to help ensure you're running the intended file/model."""
-    h = hashlib.sha1()
-    with torch.no_grad():
-        for p in model.parameters():
-            h.update(p.detach().cpu().numpy().tobytes())
-    return h.hexdigest()[:12]
-
-@contextmanager
-def bn_guard(model, label="PROBE", atol=0.0):
-    """
-    Context that asserts BN stats don’t change inside the block.
-    Use around your probe forward loop.
-    """
-    print(f"\n[BN-CHECK:{label}] entering… training={model.training}, grad_enabled={torch.is_grad_enabled()}")
-    before = snapshot_bn_state(model)
-    fp_before = model_param_fingerprint(model)
-    try:
-        yield
-    finally:
-        after = snapshot_bn_state(model)
-        fp_after = model_param_fingerprint(model)
-        print(f"[BN-CHECK:{label}] leaving…  training={model.training}, grad_enabled={torch.is_grad_enabled()}")
-        same = compare_bn_snapshots(before, after, atol=atol, quiet_ok=False)
-        print(f"[BN-CHECK:{label}] param fingerprint (before/after): {fp_before} → {fp_after}")
-        if not same:
-            print(f"[BN-CHECK:{label}] ❌ BN stats changed! Ensure model.eval() was set for the probe and no hidden training ops ran.")
-        else:
-            print(f"[BN-CHECK:{label}] ✅ BN stats unchanged.")
-
-
 
 # =================== Determinism ======================
 def set_all_seeds(seed=SEED):
@@ -335,6 +236,139 @@ class ControlledCatDogNoise(Dataset):
     def __getitem__(self, idx):
         x, _ = self.base[idx]
         return x, int(self.noisy_labels[idx]), int(idx), bool(self.noisy_mask[idx])
+    
+
+from torch.utils.data import Dataset
+import numpy as np
+
+class ControlledPairwiseSymmetricNoise(Dataset):
+    """
+    Wrap CIFAR-10 train set with controlled, pairwise-symmetric label noise.
+    - Total flips = round(total_noise_frac * len(train)), e.g., 0.05 * 50000 = 2500.
+    - Five symmetric pairs (names): 
+        ('cat','dog'), ('deer','horse'), ('automobile','truck'),
+        ('airplane','ship'), ('bird','frog')
+    - For each pair (A <-> B), we flip the same count A->B and B->A.
+    - Exposes:
+        .noisy_mask[idx] -> True if idx is flipped
+        .group_map[idx]  -> 'noisy_A->B' for flipped; otherwise class name
+        .flipped_pairs   -> dict per pair: {'A->B': [...], 'B->A': [...]}
+    """
+    DEFAULT_PAIRS = [
+        ('cat','dog'),
+        ('deer','horse'),
+        ('automobile','truck'),
+        ('airplane','ship'),
+        ('bird','frog'),
+    ]
+
+    def __init__(self, base_dataset, total_noise_frac=0.05, pairs=None, seed=777):
+        self.base = base_dataset
+        self.total_noise_frac = float(total_noise_frac)
+        self.pairs = list(pairs) if pairs is not None else list(self.DEFAULT_PAIRS)
+        self.seed = int(seed)
+
+        # -- CIFAR-10 metadata
+        self.class_names = list(self.base.classes)          # ['airplane', 'automobile', ..., 'truck']
+        self.labels = list(self.base.targets)               # len=50000 for train split
+
+        # Map pair names -> indices; validate names exist
+        def idx_of(name):
+            if name not in self.class_names:
+                raise ValueError(f"Class '{name}' not found in dataset classes: {self.class_names}")
+            return self.class_names.index(name)
+
+        self.pair_indices = [(idx_of(a), idx_of(b)) for (a,b) in self.pairs]
+        P = len(self.pair_indices)
+
+        # Build per-class index lists
+        class_to_ids = {i: [] for i in range(len(self.class_names))}
+        for i, y in enumerate(self.labels):
+            class_to_ids[y].append(i)
+
+        n = len(self.labels)
+        total_flips = int(round(self.total_noise_frac * n))
+        if total_flips <= 0:
+            raise ValueError("total_noise_frac too small; results in 0 flips.")
+        # Ensure we can achieve pairwise symmetry: allocate per pair an even number
+        # Base even allocation per pair
+        base_per_pair = total_flips // P
+        base_per_pair -= (base_per_pair % 2)  # make it even
+        allocated = base_per_pair * P
+        leftover = total_flips - allocated
+
+        # Distribute leftover in chunks of 2 per pair (to keep symmetry per pair)
+        per_pair_total = [base_per_pair for _ in range(P)]
+        li = 0
+        while leftover >= 2:
+            per_pair_total[li % P] += 2
+            leftover -= 2
+            li += 1
+        # Sanity: if any leftover remains (shouldn't), we can't keep symmetry
+        if leftover != 0:
+            raise RuntimeError("Cannot allocate flips symmetrically given total_noise_frac and number of pairs.")
+
+        # Now each pair gets per_pair_total[k] flips, split equally A->B and B->A
+        rng = np.random.default_rng(self.seed)
+        self.noisy_labels = list(self.labels)
+        self.noisy_mask = np.zeros(n, dtype=bool)
+        self.group_map = {}
+        self.flipped_pairs = {}  # {(a_name,b_name): {'A->B': [ids], 'B->A': [ids]}}
+
+        # Initialize group_map with clean class names
+        for i, y in enumerate(self.labels):
+            self.group_map[i] = self.class_names[y]
+
+        # Perform flips per pair
+        for pair_idx, (a, b) in enumerate(self.pair_indices):
+            a_name, b_name = self.class_names[a], self.class_names[b]
+            pair_key = (a_name, b_name)
+
+            total_for_pair = per_pair_total[pair_idx]
+            per_side = total_for_pair // 2
+
+            a_ids = class_to_ids[a]
+            b_ids = class_to_ids[b]
+
+            if per_side > len(a_ids) or per_side > len(b_ids):
+                raise ValueError(
+                    f"Requested {per_side} flips per side for pair ({a_name}<->{b_name}) "
+                    f"but class sizes are a={len(a_ids)}, b={len(b_ids)}."
+                )
+
+            # Sample without replacement
+            a2b_ids = rng.choice(a_ids, size=per_side, replace=False).tolist()
+            b2a_ids = rng.choice(b_ids, size=per_side, replace=False).tolist()
+
+            # Apply flips
+            for idx in a2b_ids:
+                self.noisy_labels[idx] = b
+                self.noisy_mask[idx] = True
+                self.group_map[idx] = f"noisy_{a_name}->{b_name}"
+            for idx in b2a_ids:
+                self.noisy_labels[idx] = a
+                self.noisy_mask[idx] = True
+                self.group_map[idx] = f"noisy_{b_name}->{a_name}"
+
+            # Track selections
+            self.flipped_pairs[pair_key] = {
+                f"{a_name}->{b_name}": a2b_ids,
+                f"{b_name}->{a_name}": b2a_ids,
+            }
+
+        # Summary
+        total_noisy = int(self.noisy_mask.sum())
+        print(f"[Noise] Total flips: {total_noisy} "
+              f"({100.0 * total_noisy / n:.2f}% of {n}); "
+              f"{P} pairs, symmetric per pair.")
+
+    def __len__(self): 
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        x, _ = self.base[idx]
+        return x, int(self.noisy_labels[idx]), int(idx), bool(self.noisy_mask[idx])
+
 
 # =================== LID Estimators ===================
    
@@ -735,7 +769,7 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
             model, train_loader, device, noisy_mask, use_true_labels=True, true_labels_array=true_labels_array
         )
         
-        print(f"  Train (noisy subset) — observed labels: {noisy_train_acc_observed:5.2f}%")
+        print(f"  Train (noisy subset) — corrupted labels: {noisy_train_acc_observed:5.2f}%")
         print(f"  Train (noisy subset) — true labels    : {noisy_train_acc_true:5.2f}%")
 
         # =========================================================
@@ -842,8 +876,8 @@ def main():
     train_set_raw = torchvision.datasets.CIFAR10(root='./data', train=True,  download=True, transform=transform)
     test_set      = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
 
-    # single dataset with exactly 100 cat→dog flips
-    train_set = ControlledCatDogNoise(train_set_raw, n_flip=N_CATS_FLIP, seed=FLIP_SEED)
+    # dataset with noise
+    train_set = ControlledPairwiseSymmetricNoise(train_set_raw, total_noise_frac=NOISE_RATIO, seed=FLIP_SEED)
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
     test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False)

@@ -22,14 +22,14 @@ MOMENTUM     = 0.0
 WEIGHT_DECAY = 0.0
 
 K_WINDOW     = 22          # sliding window for FIE/GIE
-FLIP_SEED    = 777         # which cats get flipped to dog
+FLIP_SEED    = 777         
 N_CATS_FLIP  = 0         
 NOISE_RATIO  = 0.05
 MIN_RUNS = 5 
 STICKY_FLAG = True        # True = once flagged, stays True; False = can turn back to False
 KAPPA = 1.0
 ALPHA_FLOOR = 0.05
-USE_CKL      = False        # True = CKL+α (NSES), False = plain CE baseline
+USE_CKL      = True        # True = CKL+α (NSES), False = plain CE baseline
 
 EPS = 1e-12
 
@@ -556,9 +556,6 @@ def per_class_accuracy(model, data_loader, device, class_ids, true_labels_array=
     acc = {c: (100.0 * counts[c][0] / max(counts[c][1], 1)) for c in class_ids}
     return acc
 
-
-from typing import Optional
-
 @torch.no_grad()
 def subset_accuracy(
     model,
@@ -855,15 +852,27 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
 
             alpha_buffer = new_alpha
 
-            # Optional diagnostic: dog flagged counts (NEXT epoch α will apply)
-            dog_idx = train_loader.dataset.dog_idx
+            # ---------- General diagnostic: flagged vs true noisy ----------
             flagged_idxs = np.where(flagged_noisy)[0]
-            dog_flagged = [i for i in flagged_idxs if int(train_loader.dataset.noisy_labels[i]) == dog_idx]
-            correct = sum(1 for i in dog_flagged if train_loader.dataset.group_map.get(i) == 'noisy')
-            incorrect = sum(1 for i in dog_flagged if train_loader.dataset.group_map.get(i) == 'dog')
-            print(f"[Post-Epoch {epoch+1}] (for next epoch) Dog flagged: total={len(dog_flagged)}, "
-                  f"correct={correct}, incorrect={incorrect}")
+            num_flagged  = int(flagged_idxs.size)
+            true_noisy   = int(train_loader.dataset.noisy_mask[flagged_idxs].sum())
+            true_clean   = num_flagged - true_noisy
+            print(f"[Post-Epoch {epoch+1}] (for next epoch) Flagged: total={num_flagged}, "
+                f"true-noisy={true_noisy}, false-positive={true_clean}")
 
+            # (Optional) per-class breakdown by current observed label:
+            obs_labels = np.array(train_loader.dataset.noisy_labels, dtype=int)
+            if num_flagged > 0:
+                by_class = {}
+                for c in range(num_classes):
+                    mask_c = (obs_labels[flagged_idxs] == c)
+                    if mask_c.any():
+                        idx_c = flagged_idxs[mask_c]
+                        tp_c  = int(train_loader.dataset.noisy_mask[idx_c].sum())
+                        fp_c  = int(idx_c.size - tp_c)
+                        by_class[c] = (tp_c, fp_c)
+                for c, (tp, fp) in by_class.items():
+                    print(f"    class {c:2d} ({class_names[c]:>10}): TP={tp}, FP={fp}")
 
 # =================== Main =============================
 def main():

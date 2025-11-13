@@ -28,10 +28,10 @@ USE_CKL      = True        # True = CKL pipeline (Step A/C); False = CE baseline
 
 # ---- Step C defaults (edit here) ----
 USE_GLOBAL_TAU   = True    # False -> per-class quantiles
-TAU_GLOBAL       = 5.0     # from Step-B FPR/TPR sweep (≈2–3% clean FPR mid/late)
+TAU_GLOBAL       = 3.0     # from Step-B FPR/TPR sweep (≈2–3% clean FPR mid/late)
 ALPHA_PER_CLASS  = 0.02    # only used when USE_GLOBAL_TAU=False
 M_RUNS           = 3       # min consecutive epochs above threshold
-WARMUP_START_MIN = 45      # start detection no earlier than this epoch index (0-based)
+WARMUP_START_MIN = 25      # start detection no earlier than this epoch index (0-based)
 
 EPS = 1e-12
 
@@ -759,6 +759,50 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                     if flags_epoch[j]: run_counter[idx] += 1
                     else:              run_counter[idx] = 0
                     final_flag[idx] = 1 if run_counter[idx] >= M_RUNS else 0
+
+                # after updating final_flag for this epoch:
+
+                noisy_mask_all = train_loader.dataset.noisy_mask  # np.bool_ array of length N
+                valid_idx_arr  = np.array(valid_indices, dtype=int)
+
+                # current-epoch flags (z > tau)
+                flags_epoch_arr = flags_epoch.astype(bool)
+
+                # persistent flags after m-runs
+                final_flags_arr = np.array([final_flag[i] for i in valid_indices], dtype=bool)
+
+                # ground-truth noisy / clean for the same indices
+                is_noisy_valid = noisy_mask_all[valid_idx_arr]
+                is_clean_valid = ~is_noisy_valid
+
+                # --- confusion for per-epoch flags (z > tau) ---
+                tp_epoch = np.sum(flags_epoch_arr & is_noisy_valid)
+                fp_epoch = np.sum(flags_epoch_arr & is_clean_valid)
+                fn_epoch = np.sum((~flags_epoch_arr) & is_noisy_valid)
+                tn_epoch = np.sum((~flags_epoch_arr) & is_clean_valid)
+
+                tpr_epoch = tp_epoch / max(tp_epoch + fn_epoch, 1)
+                fpr_epoch = fp_epoch / max(fp_epoch + tn_epoch, 1)
+
+                # --- confusion for persistent flags (m-runs) ---
+                tp_final = np.sum(final_flags_arr & is_noisy_valid)
+                fp_final = np.sum(final_flags_arr & is_clean_valid)
+                fn_final = np.sum((~final_flags_arr) & is_noisy_valid)
+                tn_final = np.sum((~final_flags_arr) & is_clean_valid)
+
+                tpr_final = tp_final / max(tp_final + fn_final, 1)
+                fpr_final = fp_final / max(fp_final + tn_final, 1)
+
+                print(
+                    f"    StepC: warmup={warmup} "
+                    f"flags(epoch)={flags_epoch_arr.mean():.4f} "
+                    f"flags(m>={M_RUNS})={final_flags_arr.mean():.4f} "
+                    f"| epochTPR={tpr_epoch:.3f} epochFPR={fpr_epoch:.3f} "
+                    f"finalTPR={tpr_final:.3f} finalFPR={fpr_final:.3f} "
+                    f"| TP_final={tp_final} FP_final={fp_final} "
+                    f"FN_final={fn_final} TN_final={tn_final} "
+                    f"meta={tau_meta}"
+                )
 
                 # quick stats for this epoch
                 idx2cls = {int(i): int(c) for i, c in zip(valid_indices, c_obs)}

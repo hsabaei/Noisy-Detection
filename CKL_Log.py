@@ -515,6 +515,30 @@ class StepALogger:
             for r in rows:
                 f.write(json.dumps(r) + "\n")
 
+class PScoreLogger:
+    """
+    JSONL logger for per-epoch persistence statistics (p-scores).
+    Each line: {
+        "epoch": int,
+        "tau": float,
+        "m": int,
+        "n_valid": int,
+        "mean_p_clean": float,
+        "mean_p_noisy": float,
+        "max_p_clean": int,
+        "max_p_noisy": int,
+        "hist_clean": { "0": count, "1": count, ... },
+        "hist_noisy": { ... }
+    }
+    """
+    def __init__(self, path="logs_p_scores.jsonl"):
+        self.path = path
+        open(self.path, "w").close()  # truncate
+
+    def log(self, row: dict):
+        with open(self.path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+
 # =================== Training & logging ===============
 def train_model(model, train_loader, test_loader, num_epochs, k, device):
     model = model.to(device)
@@ -532,6 +556,13 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
     train_loss_history, test_loss_history = [], []
 
     num_classes = len(train_loader.dataset.base.classes)
+
+    # --- Persistence (p-score) state and logger ---
+    from collections import defaultdict
+    run_counter = defaultdict(int)   # idx -> current run length p_i
+    final_flag  = defaultdict(int)   # idx -> 0/1 after m-run gate
+    p_logger    = PScoreLogger("logs_p_scores.jsonl")
+
 
     # For CKL path only
     lid = LIDEstimators(device=device)
@@ -759,6 +790,55 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                     if flags_epoch[j]: run_counter[idx] += 1
                     else:              run_counter[idx] = 0
                     final_flag[idx] = 1 if run_counter[idx] >= M_RUNS else 0
+
+                # --------- p-score statistics (per epoch) ----------
+                # p-score = current run length for each valid sample
+                noisy_mask = train_loader.dataset.noisy_mask  # boolean array, len = n_samples
+
+                # collect p-scores only for samples that had CKL this epoch (valid_indices)
+                p_all   = np.array([run_counter[idx] for idx in valid_indices], dtype=int)
+                is_noisy = noisy_mask[valid_indices]  # True if this index is a flipped/noisy sample
+
+                p_clean = p_all[~is_noisy]
+                p_noisy = p_all[ is_noisy]
+
+                def _hist_counts(ps):
+                    # small integer histogram: 0..max_p
+                    if ps.size == 0:
+                        return {}
+                    max_p = int(ps.max())
+                    hist = {}
+                    for v in range(max_p + 1):
+                        hist[str(v)] = int(np.sum(ps == v))
+                    return hist
+
+                row = {
+                    "epoch": int(epoch),
+                    "tau": float(TAU_GLOBAL),    # your current τ
+                    "m": int(M_RUNS),
+                    "n_valid": int(len(valid_indices)),
+                    "mean_p_clean": float(p_clean.mean()) if p_clean.size > 0 else 0.0,
+                    "mean_p_noisy": float(p_noisy.mean()) if p_noisy.size > 0 else 0.0,
+                    "max_p_clean": int(p_clean.max()) if p_clean.size > 0 else 0,
+                    "max_p_noisy": int(p_noisy.max()) if p_noisy.size > 0 else 0,
+                    "hist_clean": _hist_counts(p_clean),
+                    "hist_noisy": _hist_counts(p_noisy),
+                }
+                p_logger.log(row)
+
+                # Optional: fraction flagged after m-run gate (for sanity)
+                final_flags_epoch = np.array(
+                    [final_flag[idx] for idx in valid_indices],
+                    dtype=int
+                )
+                flag_frac = float(final_flags_epoch.mean()) if final_flags_epoch.size > 0 else 0.0
+
+                print(
+                    f"    StepC: warmup={warmup} "
+                    f"flags(epoch)={flags_epoch.mean():.4f} "
+                    f"flags(m>={M_RUNS})={flag_frac:.4f} "
+                    f"meta={{'global_tau': {TAU_GLOBAL}}}"
+                )
 
                 # after updating final_flag for this epoch:
 

@@ -481,7 +481,7 @@ def subset_accuracy(
     model.train()
     return 100.0 * correct / max(total, 1)
 
-# =================== Step A helpers & logging ===================
+# =================== Helpers & logging ===================
 
 def mad_scaled(x: np.ndarray) -> float:
     """Scaled MAD to be comparable to std under normality."""
@@ -539,6 +539,55 @@ class PScoreLogger:
         with open(self.path, "a") as f:
             f.write(json.dumps(row) + "\n")
 
+class Step6Logger:
+    """
+    Logs for investigating geometric vs arithmetic class references.
+
+    samples_path:
+        One line per sample with valid GIE/W this epoch:
+        {
+          "epoch": int,
+          "idx": int,
+          "cls_obs": int,
+          "y_true": int,
+          "d": float,
+          "w": float,
+          "ckl_geo": float,   # CKL to geometric ref (current method)
+          "ckl_arith": float  # CKL to arithmetic ref
+        }
+
+    classes_path:
+        One line per class per epoch:
+        {
+          "epoch": int,
+          "class": int,
+          "n": int,          # number of samples used for refs
+          "d_geo": float,
+          "w_geo": float,
+          "d_arith": float,
+          "w_arith": float
+        }
+    """
+    def __init__(self,
+                 samples_path: str = "logs_step6_samples.jsonl",
+                 classes_path: str = "logs_step6_classes.jsonl"):
+        self.samples_path = samples_path
+        self.classes_path = classes_path
+        # truncate if exist
+        open(self.samples_path, "w").close()
+        open(self.classes_path, "w").close()
+
+    def log_samples(self, rows):
+        with open(self.samples_path, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def log_classes(self, rows):
+        with open(self.classes_path, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+
 # =================== Training & logging ===============
 def train_model(model, train_loader, test_loader, num_epochs, k, device):
     model = model.to(device)
@@ -562,6 +611,12 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
     run_counter = defaultdict(int)   # idx -> current run length p_i
     final_flag  = defaultdict(int)   # idx -> 0/1 after m-run gate
     p_logger    = PScoreLogger("logs_p_scores.jsonl")
+
+    # --- Step 6 logger (d,w + CKL_geo/arith) ---
+    step6 = Step6Logger(
+        samples_path="logs_step6_samples.jsonl",
+        classes_path="logs_step6_classes.jsonl"
+    )
 
 
     # For CKL path only
@@ -719,6 +774,92 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                 if np.isfinite(ckl_val):
                     per_cls_ckl[cls_obs].append(float(ckl_val))
                     sample_ckl[idx] = (float(ckl_val), cls_obs)
+
+            # =======================================================
+            # Step 6: d,w per class; CKL vs geometric vs arithmetic ref
+            # =======================================================
+
+            # 6.1 collect d (=GIE) and w per observed class in *linear* space
+            per_cls_d_lin = {c: [] for c in range(num_classes)}
+            per_cls_w_lin = {c: [] for c in range(num_classes)}
+            for idx, (gie_tr, w_tr, cls_obs) in sample_stats.items():
+                if not (np.isfinite(gie_tr) and gie_tr > 0.0 and
+                        np.isfinite(w_tr)  and w_tr  > 0.0):
+                    continue
+                per_cls_d_lin[cls_obs].append(float(gie_tr))
+                per_cls_w_lin[cls_obs].append(float(w_tr))
+
+            # geometric references are already in ref_d, ref_w (Huber on logs)
+            d_geo = np.array(ref_d, dtype=float)
+            w_geo = np.array(ref_w, dtype=float)
+
+            # arithmetic references per class
+            d_arith = np.full(num_classes, np.nan, dtype=float)
+            w_arith = np.full(num_classes, np.nan, dtype=float)
+            n_per_class = np.zeros(num_classes, dtype=int)
+
+            for c in range(num_classes):
+                dc = np.asarray(per_cls_d_lin[c], dtype=float)
+                wc = np.asarray(per_cls_w_lin[c], dtype=float)
+                n_per_class[c] = int(dc.size)
+                if dc.size > 0:
+                    d_arith[c] = float(np.mean(dc))
+                if wc.size > 0:
+                    w_arith[c] = float(np.mean(wc))
+
+            # Prepare per-sample logs for this epoch:
+            #   for the same set of indices where CKL_geo exists (sample_ckl.keys())
+            valid_indices_6 = sorted(sample_ckl.keys())
+            if len(valid_indices_6) > 0:
+                y_true_array = np.array(train_loader.dataset.labels, dtype=int)
+                samples_rows_6 = []
+
+                for idx in valid_indices_6:
+                    ckl_geo_val, cls_obs = sample_ckl[idx]
+                    d_i, w_i, cls_i = sample_stats[idx]   # (gie_tr, w_tr, cls_obs)
+                    assert cls_i == cls_obs
+
+                    # references
+                    dg = d_geo[cls_obs]
+                    wg = w_geo[cls_obs]
+                    da = d_arith[cls_obs]
+                    wa = w_arith[cls_obs]
+
+                    # CKL to arithmetic reference (may be NaN if missing)
+                    if np.isfinite(da) and da > 0.0 and np.isfinite(wa) and wa > 0.0:
+                        ckl_arith_val = ckl_finite(w_i, d_i, wa, da)
+                    else:
+                        ckl_arith_val = np.nan
+
+                    samples_rows_6.append({
+                        "epoch": int(epoch),
+                        "idx": int(idx),
+                        "cls_obs": int(cls_obs),
+                        "y_true": int(y_true_array[idx]),
+                        "d": float(d_i),
+                        "w": float(w_i),
+                        "ckl_geo": float(ckl_geo_val),
+                        "ckl_arith": float(ckl_arith_val) if np.isfinite(ckl_arith_val) else None
+                    })
+
+                step6.log_samples(samples_rows_6)
+
+                # per-class summary row for this epoch (refs only)
+                classes_rows_6 = []
+                for c in range(num_classes):
+                    if n_per_class[c] == 0:
+                        continue
+                    classes_rows_6.append({
+                        "epoch": int(epoch),
+                        "class": int(c),
+                        "n": int(n_per_class[c]),
+                        "d_geo": float(d_geo[c]) if np.isfinite(d_geo[c]) else None,
+                        "w_geo": float(w_geo[c]) if np.isfinite(w_geo[c]) else None,
+                        "d_arith": float(d_arith[c]) if np.isfinite(d_arith[c]) else None,
+                        "w_arith": float(w_arith[c]) if np.isfinite(w_arith[c]) else None,
+                    })
+                step6.log_classes(classes_rows_6)
+            # end Step 6
 
             # --- Step A: standardize within observed class, log ---
             y_obs_array  = np.array(train_loader.dataset.noisy_labels, dtype=int)

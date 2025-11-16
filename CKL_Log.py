@@ -802,10 +802,14 @@ def train_model(model, train_loader, test_loader, num_epochs, k, device):
                 dc = np.asarray(per_cls_d_lin[c], dtype=float)
                 wc = np.asarray(per_cls_w_lin[c], dtype=float)
                 n_per_class[c] = int(dc.size)
+
                 if dc.size > 0:
-                    d_arith[c] = float(np.mean(dc))
+                    # robust arithmetic reference in *linear* space
+                    d_arith[c] = float(huber_mean(dc))
+
                 if wc.size > 0:
-                    w_arith[c] = float(np.mean(wc))
+                    # robust arithmetic reference in *linear* space
+                    w_arith[c] = float(huber_mean(wc))
 
             # Prepare per-sample logs for this epoch:
             #   for the same set of indices where CKL_geo exists (sample_ckl.keys())
